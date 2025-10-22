@@ -18,11 +18,48 @@ This service provides a simple, stateless HTTP API for controlling FreeSWITCH ca
 
 ## Installation
 
-The service is already installed and configured:
+### Quick Install (Recommended)
 
-- **Binary Location**: `/root/fs-api/fs-api`
-- **Service File**: `/etc/systemd/system/fs-api.service`
-- **Working Directory**: `/root/fs-api`
+Use the automated installation script:
+
+```bash
+# Clone the repository
+git clone https://github.com/emaktel/fs-api.git
+cd fs-api
+
+# Run the installer (auto-detects OS and architecture)
+./install.sh
+```
+
+The installer will:
+- Download the correct binary for your platform
+- Install to `/usr/local/bin/fs-api`
+- Set up systemd service (Linux only)
+- Enable auto-start on boot
+
+### Manual Installation
+
+Download the binary for your platform from [releases](https://github.com/emaktel/fs-api/releases/latest):
+
+```bash
+# Linux AMD64
+wget https://github.com/emaktel/fs-api/releases/download/v0.1.0/fs-api-linux-amd64
+chmod +x fs-api-linux-amd64
+sudo mv fs-api-linux-amd64 /usr/local/bin/fs-api
+
+# Install systemd service (Linux)
+sudo cp fs-api.service /etc/systemd/system/fs-api.service
+sudo systemctl daemon-reload
+sudo systemctl enable fs-api
+sudo systemctl start fs-api
+```
+
+### Installation Locations
+
+After installation:
+- **Binary Location**: `/usr/local/bin/fs-api`
+- **Service File**: `/etc/systemd/system/fs-api.service` (Linux)
+- **Working Directory**: `/usr/local/bin`
 
 ## Configuration
 
@@ -48,7 +85,7 @@ export ESL_PORT="8021"
 export ESL_PASSWORD="MySecurePassword"
 
 # Run the service
-./fs-api-server
+fs-api
 ```
 
 **Using Systemd with Environment Variables**:
@@ -60,7 +97,7 @@ Environment="FSAPI_PORT=8080"
 Environment="ESL_HOST=freeswitch.example.com"
 Environment="ESL_PORT=8021"
 Environment="ESL_PASSWORD=MySecurePassword"
-ExecStart=/root/fs-api/fs-api
+ExecStart=/usr/local/bin/fs-api
 ```
 
 Then reload and restart:
@@ -567,25 +604,25 @@ All endpoints return error responses in the following format:
 
 ### ESL Integration
 
-The current implementation includes a simplified ESL client that logs commands. For production use with an actual FreeSWITCH server, you should integrate a proper ESL library.
-
-**Recommended ESL Library**: `github.com/fiorix/go-eventsocket`
-
-To integrate:
-```bash
-go get github.com/fiorix/go-eventsocket
-```
-
-Then modify the `SimpleESL` struct in `main.go` to use the library for actual ESL connections.
+The API uses the `github.com/percipia/eslgo` library for FreeSWITCH Event Socket Library communication. This provides a production-ready ESL client with connection pooling and automatic reconnection.
 
 ## Building from Source
 
 If you need to rebuild the application:
 
 ```bash
-cd /root/fs-api
+# Clone the repository
+git clone https://github.com/emaktel/fs-api.git
+cd fs-api
+
+# Build the binary
 go build -o fs-api main.go
-systemctl restart fs-api.service
+
+# Install it
+sudo mv fs-api /usr/local/bin/fs-api
+
+# Restart the service (if using systemd)
+sudo systemctl restart fs-api.service
 ```
 
 ## Troubleshooting
