@@ -1,0 +1,19 @@
+[Unit]
+Description=FreeSWITCH Call Control API Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/local/bin
+ExecStart=/usr/local/bin/fs-api
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security settings
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
