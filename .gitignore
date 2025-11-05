@@ -40,3 +40,6 @@ go.work
 # Temporary files
 tmp/
 temp/
+
+# Build outputs
+builds/
