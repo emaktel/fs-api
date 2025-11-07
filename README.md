@@ -8,9 +8,9 @@ This service provides a simple, stateless HTTP API for controlling FreeSWITCH ca
 
 ## Features
 
-- **10 API Endpoints**: 9 Call Control + 1 Status endpoint
+- **11 API Endpoints**: 9 Call Control + 2 Query endpoints
   - Call Control: Hangup, Transfer, Bridge, Answer, Hold/Unhold, Record, DTMF, Park, Originate
-  - System: FreeSWITCH Status
+  - Query: Call Details, FreeSWITCH Status
 - **RESTful Design**: Clean JSON API following OpenAPI 3.0 specification
 - **Production Ready**: UUID validation, request tracing, structured logging, graceful shutdown
 - **Systemd Integration**: Runs as a system service with automatic restart
@@ -161,11 +161,58 @@ GET /health
 curl http://localhost:37274/health
 ```
 
-**Response**: `OK`
+**Response**:
+```json
+{
+  "status": "healthy",
+  "version": "0.1.0"
+}
+```
 
 ---
 
-### 1. Hangup Call
+### 1. Get Call Details
+Retrieve complete call information including both A-leg and B-leg details.
+
+```bash
+GET /v1/calls/{uuid}
+```
+
+**Description**: This endpoint efficiently retrieves full call details using a 3-step process:
+1. Looks up the call using `show calls as json` to get both A-leg and B-leg UUIDs
+2. Dumps A-leg channel variables using `uuid_dump`
+3. Dumps B-leg channel variables using `uuid_dump` (if B-leg exists)
+
+**Example**:
+```bash
+curl http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcdef
+```
+
+**Response**:
+```json
+{
+  "status": "success",
+  "data": {
+    "call_info": "{\"row_count\":1,\"rows\":[{...}]}",
+    "aleg_uuid": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+    "aleg_details": "Channel-Name: sofia/internal/...\nChannel-State: CS_EXECUTE\n...",
+    "bleg_uuid": "e5f6-7890-1234-5678-90abcdef1234",
+    "bleg_details": "Channel-Name: sofia/external/...\nChannel-State: CS_EXCHANGE_MEDIA\n..."
+  }
+}
+```
+
+**Error Response (Call Not Found)**:
+```json
+{
+  "status": "error",
+  "message": "Call a1b2c3d4-e5f6-7890-1234-567890abcdef not found"
+}
+```
+
+---
+
+### 2. Hangup Call
 Terminate a specific call leg.
 
 ```bash
@@ -196,7 +243,7 @@ curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcde
 
 ---
 
-### 2. Transfer Call
+### 3. Transfer Call
 Transfer a call to a new destination in the dialplan. Supports transferring A-leg (default), B-leg, or both legs.
 
 ```bash
@@ -259,7 +306,7 @@ curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcde
 
 ---
 
-### 3. Bridge Calls
+### 4. Bridge Calls
 Bridge two separate call legs together.
 
 ```bash
@@ -291,7 +338,7 @@ curl -X POST http://localhost:37274/v1/calls/bridge \
 
 ---
 
-### 4. Answer Call
+### 5. Answer Call
 Answer a ringing call.
 
 ```bash
@@ -313,7 +360,7 @@ curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcde
 
 ---
 
-### 5. Hold/Unhold Call
+### 6. Hold/Unhold Call
 Place a call on hold or unhold it.
 
 ```bash
@@ -352,7 +399,7 @@ curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcde
 
 ---
 
-### 6. Record Call
+### 7. Record Call
 Start or stop recording a call.
 
 ```bash
@@ -397,7 +444,7 @@ curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcde
 
 ---
 
-### 7. Send DTMF
+### 8. Send DTMF
 Send DTMF digits to a call leg.
 
 ```bash
@@ -432,7 +479,7 @@ curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcde
 
 ---
 
-### 8. Park Call
+### 9. Park Call
 Park a specific call leg.
 
 ```bash
@@ -454,7 +501,7 @@ curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcde
 
 ---
 
-### 9. Originate Call
+### 10. Originate Call
 Initiate a new call between two endpoints.
 
 ```bash
@@ -533,7 +580,7 @@ curl -X POST http://localhost:37274/v1/calls/originate \
 
 ---
 
-### 10. Get FreeSWITCH Status
+### 11. Get FreeSWITCH Status
 Retrieve detailed status information from the FreeSWITCH server.
 
 ```bash

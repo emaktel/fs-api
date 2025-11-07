@@ -790,6 +790,87 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GET /v1/calls/{uuid}
+func (h *APIHandler) GetCallDetails(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	callUUID := vars["uuid"]
+	requestID := getRequestID(r)
+
+	// Validate UUID
+	if err := validateUUID(callUUID); err != nil {
+		h.respondError(w, r, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Step 1: Get call information to extract both A-leg and B-leg UUIDs
+	showCallsCmd := fmt.Sprintf("api show calls as json where uuid='%s'", callUUID)
+	callsResponse, err := h.eslClient.SendCommand(showCallsCmd)
+	if err != nil {
+		statusCode := h.getErrorStatusCode(err)
+		h.respondError(w, r, fmt.Sprintf("Failed to retrieve call information: %v", err), statusCode)
+		return
+	}
+
+	// Step 2: Parse JSON response to extract UUIDs
+	var callsData struct {
+		RowCount int `json:"row_count"`
+		Rows     []struct {
+			UUID  string `json:"uuid"`
+			BUUID string `json:"b_uuid"`
+		} `json:"rows"`
+	}
+
+	if err := json.Unmarshal([]byte(callsResponse), &callsData); err != nil {
+		h.respondError(w, r, fmt.Sprintf("Failed to parse call information: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Check if call was found
+	if callsData.RowCount == 0 || len(callsData.Rows) == 0 {
+		h.respondError(w, r, fmt.Sprintf("Call %s not found", callUUID), http.StatusNotFound)
+		return
+	}
+
+	aLegUUID := callsData.Rows[0].UUID
+	bLegUUID := callsData.Rows[0].BUUID
+
+	// Step 3: Dump A-leg details
+	aLegDumpCmd := fmt.Sprintf("api uuid_dump %s", aLegUUID)
+	aLegDetails, err := h.eslClient.SendCommand(aLegDumpCmd)
+	if err != nil {
+		logWarn(requestID, fmt.Sprintf("Failed to retrieve A-leg details: %v", err))
+		aLegDetails = ""
+	}
+
+	// Step 4: Dump B-leg details (if B-leg exists)
+	var bLegDetails string
+	if bLegUUID != "" {
+		bLegDumpCmd := fmt.Sprintf("api uuid_dump %s", bLegUUID)
+		bLegDetails, err = h.eslClient.SendCommand(bLegDumpCmd)
+		if err != nil {
+			logWarn(requestID, fmt.Sprintf("Failed to retrieve B-leg details: %v", err))
+			bLegDetails = ""
+		}
+	}
+
+	logInfo(requestID, fmt.Sprintf("Call details retrieved for %s", callUUID))
+
+	// Return the complete call information
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Request-ID", requestID)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "success",
+		"data": map[string]interface{}{
+			"call_info":    callsResponse,
+			"aleg_uuid":    aLegUUID,
+			"aleg_details": aLegDetails,
+			"bleg_uuid":    bLegUUID,
+			"bleg_details": bLegDetails,
+		},
+	})
+}
+
 // GET /v1/status
 func (h *APIHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
 	requestID := getRequestID(r)
@@ -869,6 +950,7 @@ func main() {
 	v1.HandleFunc("/calls/{uuid}/dtmf", handler.SendDTMF).Methods("POST")
 	v1.HandleFunc("/calls/{uuid}/park", handler.ParkCall).Methods("POST")
 	v1.HandleFunc("/calls/originate", handler.OriginateCall).Methods("POST")
+	v1.HandleFunc("/calls/{uuid}", handler.GetCallDetails).Methods("GET")
 	v1.HandleFunc("/status", handler.GetStatus).Methods("GET")
 
 	// Improved health check endpoint that tests ESL connection
