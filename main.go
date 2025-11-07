@@ -851,41 +851,92 @@ func (h *APIHandler) GetCallDetails(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 3: Dump A-leg details
-	aLegDumpCmd := fmt.Sprintf("api uuid_dump %s", aLegUUID)
-	aLegDetails, err := h.eslClient.SendCommand(aLegDumpCmd)
+	// Step 3: Dump A-leg details as JSON
+	aLegDumpCmd := fmt.Sprintf("api uuid_dump %s json", aLegUUID)
+	aLegDetailsStr, err := h.eslClient.SendCommand(aLegDumpCmd)
 	if err != nil {
 		logWarn(requestID, fmt.Sprintf("Failed to retrieve A-leg details: %v", err))
-		aLegDetails = ""
+		h.respondError(w, r, fmt.Sprintf("Failed to retrieve A-leg details: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Parse A-leg JSON
+	var aLegDetails map[string]interface{}
+	if err := json.Unmarshal([]byte(aLegDetailsStr), &aLegDetails); err != nil {
+		logWarn(requestID, fmt.Sprintf("Failed to parse A-leg details: %v", err))
+		h.respondError(w, r, fmt.Sprintf("Failed to parse A-leg details: %v", err), http.StatusInternalServerError)
+		return
 	}
 
 	// Step 4: Dump B-leg details (if B-leg exists)
-	var bLegDetails string
+	var bLegDetails map[string]interface{}
 	if bLegUUID != "" {
-		bLegDumpCmd := fmt.Sprintf("api uuid_dump %s", bLegUUID)
-		bLegDetails, err = h.eslClient.SendCommand(bLegDumpCmd)
+		bLegDumpCmd := fmt.Sprintf("api uuid_dump %s json", bLegUUID)
+		bLegDetailsStr, err := h.eslClient.SendCommand(bLegDumpCmd)
 		if err != nil {
 			logWarn(requestID, fmt.Sprintf("Failed to retrieve B-leg details: %v", err))
-			bLegDetails = ""
+			// B-leg might not exist anymore, this is not fatal
+			bLegDetails = nil
+		} else {
+			if err := json.Unmarshal([]byte(bLegDetailsStr), &bLegDetails); err != nil {
+				logWarn(requestID, fmt.Sprintf("Failed to parse B-leg details: %v", err))
+				bLegDetails = nil
+			}
 		}
+	}
+
+	// Parse call_info JSON and extract the first row
+	var callInfoWrapper struct {
+		RowCount int                      `json:"row_count"`
+		Rows     []map[string]interface{} `json:"rows"`
+	}
+	if err := json.Unmarshal([]byte(callsResponse), &callInfoWrapper); err != nil {
+		logWarn(requestID, fmt.Sprintf("Failed to parse call info: %v", err))
+		h.respondError(w, r, fmt.Sprintf("Failed to parse call info: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Validate that we got data (we already validated the call exists)
+	if len(callInfoWrapper.Rows) == 0 {
+		h.respondError(w, r, "Call data not found in response", http.StatusInternalServerError)
+		return
 	}
 
 	logInfo(requestID, fmt.Sprintf("Call details retrieved for %s", callUUID))
 
-	// Return the complete call information
+	// Return the complete call information with clean structure
+	// Note: We build the response manually to control field ordering in JSON output
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Request-ID", requestID)
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status": "success",
-		"data": map[string]interface{}{
-			"call_info":    callsResponse,
-			"aleg_uuid":    aLegUUID,
-			"aleg_details": aLegDetails,
-			"bleg_uuid":    bLegUUID,
-			"bleg_details": bLegDetails,
-		},
-	})
+
+	// Build response with ordered keys: status, call_info, aleg (uuid then details), bleg (uuid then details)
+	var responseJSON strings.Builder
+	responseJSON.WriteString(`{"status":"success","call_info":`)
+
+	// Just use call_info as-is from FreeSWITCH (preserves their ordering)
+	callInfoJSON, _ := json.Marshal(callInfoWrapper.Rows[0])
+	responseJSON.Write(callInfoJSON)
+
+	responseJSON.WriteString(`,"aleg":{"uuid":"`)
+	responseJSON.WriteString(aLegUUID)
+	responseJSON.WriteString(`","details":`)
+	aLegJSON, _ := json.Marshal(aLegDetails)
+	responseJSON.Write(aLegJSON)
+	responseJSON.WriteString(`}`)
+
+	if bLegUUID != "" {
+		responseJSON.WriteString(`,"bleg":{"uuid":"`)
+		responseJSON.WriteString(bLegUUID)
+		responseJSON.WriteString(`","details":`)
+		bLegJSON, _ := json.Marshal(bLegDetails)
+		responseJSON.Write(bLegJSON)
+		responseJSON.WriteString(`}`)
+	}
+
+	responseJSON.WriteString(`}`)
+
+	w.Write([]byte(responseJSON.String()))
 }
 
 // GET /v1/status

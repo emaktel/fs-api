@@ -180,27 +180,105 @@ GET /v1/calls/{uuid}
 
 **Description**: This endpoint efficiently retrieves full call details using a 3-step process:
 1. Looks up the call using `show calls as json` to get both A-leg and B-leg UUIDs
-2. Dumps A-leg channel variables using `uuid_dump`
-3. Dumps B-leg channel variables using `uuid_dump` (if B-leg exists)
+2. Dumps A-leg channel variables using `uuid_dump <uuid> json`
+3. Dumps B-leg channel variables using `uuid_dump <uuid> json` (if B-leg exists)
+
+All data is returned as properly structured JSON objects. You can query by either A-leg or B-leg UUID.
 
 **Example**:
 ```bash
 curl http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcdef
 ```
 
-**Response**:
+**Response (Bridged Call - Two Legs)**:
 ```json
 {
   "status": "success",
-  "data": {
-    "call_info": "{\"row_count\":1,\"rows\":[{...}]}",
-    "aleg_uuid": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
-    "aleg_details": "Channel-Name: sofia/internal/...\nChannel-State: CS_EXECUTE\n...",
-    "bleg_uuid": "e5f6-7890-1234-5678-90abcdef1234",
-    "bleg_details": "Channel-Name: sofia/external/...\nChannel-State: CS_EXCHANGE_MEDIA\n..."
+  "call_info": {
+    "uuid": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+    "direction": "inbound",
+    "created": "2025-11-07 17:47:10",
+    "created_epoch": "1762555630",
+    "name": "sofia/internal/100@domain.com",
+    "state": "CS_EXECUTE",
+    "cid_name": "100",
+    "cid_num": "100",
+    "dest": "5146272886",
+    "callstate": "ACTIVE",
+    "accountcode": "domain.com",
+    "b_uuid": "e5f6-7890-1234-5678-90abcdef1234",
+    "b_direction": "outbound",
+    "b_created": "2025-11-07 17:47:10",
+    "b_name": "sofia/external/+15551234567",
+    "b_state": "CS_EXCHANGE_MEDIA",
+    "b_cid_name": "Caller",
+    "b_cid_num": "+15551234567",
+    "b_callstate": "ACTIVE"
+  },
+  "aleg": {
+    "uuid": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+    "details": {
+      "Channel-Name": "sofia/internal/100@domain.com",
+      "Channel-State": "CS_EXECUTE",
+      "Call-Direction": "inbound",
+      "Caller-Caller-ID-Name": "100",
+      "Caller-Caller-ID-Number": "100",
+      "Answer-State": "answered",
+      "Caller-Destination-Number": "5146272886"
+    }
+  },
+  "bleg": {
+    "uuid": "e5f6-7890-1234-5678-90abcdef1234",
+    "details": {
+      "Channel-Name": "sofia/external/+15551234567",
+      "Channel-State": "CS_EXCHANGE_MEDIA",
+      "Call-Direction": "outbound",
+      "Caller-Caller-ID-Name": "Caller",
+      "Caller-Caller-ID-Number": "+15551234567",
+      "Answer-State": "answered"
+    }
   }
 }
 ```
+
+**Response (Single Leg Call)**:
+```json
+{
+  "status": "success",
+  "call_info": {
+    "uuid": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+    "direction": "inbound",
+    "created": "2025-11-07 18:06:21",
+    "name": "sofia/internal/100@domain.com",
+    "state": "CS_EXECUTE",
+    "cid_name": "100",
+    "cid_num": "100",
+    "dest": "*9667",
+    "callstate": "ACTIVE",
+    "b_uuid": "",
+    "b_direction": "",
+    "b_name": ""
+  },
+  "aleg": {
+    "uuid": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+    "details": {
+      "Channel-Name": "sofia/internal/100@domain.com",
+      "Channel-State": "CS_EXECUTE",
+      "Call-Direction": "inbound",
+      "Caller-Caller-ID-Name": "100",
+      "Caller-Caller-ID-Number": "100",
+      "Answer-State": "answered"
+    }
+  }
+}
+```
+
+**Notes**:
+- `call_info` contains summary information from FreeSWITCH's `show calls` output
+- `aleg` contains full channel details for the A-leg from `uuid_dump`
+- `bleg` is only included if the call has a B-leg (bridged call)
+- All b_ prefixed fields in `call_info` will be empty strings for single-leg calls
+- You can query using either the A-leg UUID or B-leg UUID
 
 **Error Response (Call Not Found)**:
 ```json
