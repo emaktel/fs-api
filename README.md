@@ -197,32 +197,63 @@ curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcde
 ---
 
 ### 2. Transfer Call
-Transfer a call to a new destination in the dialplan.
+Transfer a call to a new destination in the dialplan. Supports transferring A-leg (default), B-leg, or both legs.
 
 ```bash
 POST /v1/calls/{uuid}/transfer
 ```
 
-**Request Body** (required):
+**Request Body**:
 ```json
 {
   "destination": "5000",
+  "leg": "aleg",
+  "dialplan": "XML",
   "context": "internal"
 }
 ```
 
-**Example**:
+**Parameters**:
+- `destination` (required): Destination extension or number
+- `leg` (optional): Which leg to transfer - `"aleg"` (default), `"bleg"`, or `"both"`
+- `dialplan` (optional): Dialplan type - defaults to `"XML"` when context is provided
+- `context` (optional): Dialplan context - if provided, dialplan will also be sent (defaults to "XML")
+
+**Note**: `dialplan` and `context` are sent as a pair. If you omit `context`, the `dialplan` parameter is ignored.
+
+**Example 1 - Basic transfer (A-leg, no context)**:
+```bash
+curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcdef/transfer \
+  -H "Content-Type: application/json" \
+  -d '{"destination":"5000"}'
+```
+
+**Example 2 - Transfer with context (dialplan defaults to XML)**:
 ```bash
 curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcdef/transfer \
   -H "Content-Type: application/json" \
   -d '{"destination":"5000","context":"internal"}'
 ```
 
+**Example 3 - Transfer B-leg**:
+```bash
+curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcdef/transfer \
+  -H "Content-Type: application/json" \
+  -d '{"destination":"*9664","context":"f1-dev.emaktech.com","leg":"bleg"}'
+```
+
+**Example 4 - Transfer both legs**:
+```bash
+curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcdef/transfer \
+  -H "Content-Type: application/json" \
+  -d '{"destination":"5000","context":"internal","leg":"both"}'
+```
+
 **Response**:
 ```json
 {
   "status": "success",
-  "message": "Call a1b2c3d4-e5f6-7890-1234-567890abcdef transferred to 5000 in context internal"
+  "message": "Call a1b2c3d4-e5f6-7890-1234-567890abcdef (A-leg) transferred to 5000 dialplan XML context internal"
 }
 ```
 

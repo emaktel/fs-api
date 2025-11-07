@@ -119,8 +119,10 @@ type HangupRequest struct {
 }
 
 type TransferRequest struct {
-	Destination string `json:"destination"`
-	Context     string `json:"context"`
+	Destination string `json:"destination"`        // Required: destination extension
+	Dialplan    string `json:"dialplan,omitempty"` // Optional: dialplan type (e.g., "XML")
+	Context     string `json:"context,omitempty"`  // Optional: dialplan context
+	Leg         string `json:"leg,omitempty"`      // Optional: "aleg" (default), "bleg", or "both"
 }
 
 type BridgeRequest struct {
@@ -390,20 +392,76 @@ func (h *APIHandler) TransferCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Destination == "" || req.Context == "" {
-		h.respondError(w, r, "destination and context are required", http.StatusBadRequest)
+	// Only destination is required
+	if req.Destination == "" {
+		h.respondError(w, r, "destination is required", http.StatusBadRequest)
 		return
 	}
 
-	cmd := fmt.Sprintf("api uuid_transfer %s %s XML %s", callUUID, req.Destination, req.Context)
-	_, err := h.eslClient.SendCommand(cmd)
+	// Default to "aleg" if not specified
+	if req.Leg == "" {
+		req.Leg = "aleg"
+	}
+
+	// Validate leg parameter
+	leg := strings.ToLower(req.Leg)
+	if leg != "aleg" && leg != "bleg" && leg != "both" {
+		h.respondError(w, r, "leg must be 'aleg', 'bleg', or 'both'", http.StatusBadRequest)
+		return
+	}
+
+	// Build the command: uuid_transfer <uuid> [-bleg|-both] <dest-exten> [<dialplan>] [<context>]
+	var cmd strings.Builder
+	cmd.WriteString("api uuid_transfer ")
+	cmd.WriteString(callUUID)
+	cmd.WriteString(" ")
+
+	// Add optional flag (-bleg or -both)
+	var legType string
+	if leg == "bleg" {
+		cmd.WriteString("-bleg ")
+		legType = "B-leg"
+	} else if leg == "both" {
+		cmd.WriteString("-both ")
+		legType = "both legs"
+	} else {
+		legType = "A-leg"
+	}
+
+	// Add destination (required)
+	cmd.WriteString(req.Destination)
+
+	// Add dialplan and context as a pair (both or neither)
+	// If context is provided, dialplan defaults to "XML"
+	if req.Context != "" {
+		dialplan := req.Dialplan
+		if dialplan == "" {
+			dialplan = "XML"
+		}
+		cmd.WriteString(" ")
+		cmd.WriteString(dialplan)
+		cmd.WriteString(" ")
+		cmd.WriteString(req.Context)
+	}
+
+	_, err := h.eslClient.SendCommand(cmd.String())
 	if err != nil {
 		statusCode := h.getErrorStatusCode(err)
 		h.respondError(w, r, fmt.Sprintf("Failed to transfer call: %v", err), statusCode)
 		return
 	}
 
-	h.respondSuccess(w, r, fmt.Sprintf("Call %s transferred to %s in context %s", callUUID, req.Destination, req.Context))
+	// Build success message
+	var message strings.Builder
+	message.WriteString(fmt.Sprintf("Call %s (%s) transferred to %s", callUUID, legType, req.Destination))
+	if req.Dialplan != "" {
+		message.WriteString(fmt.Sprintf(" dialplan %s", req.Dialplan))
+	}
+	if req.Context != "" {
+		message.WriteString(fmt.Sprintf(" context %s", req.Context))
+	}
+
+	h.respondSuccess(w, r, message.String())
 }
 
 // POST /v1/calls/bridge
@@ -624,15 +682,16 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, r, "aleg is required", http.StatusBadRequest)
 		return
 	}
+
+	// If bleg is not provided, default to park
 	if req.BLeg == "" {
-		h.respondError(w, r, "bleg is required", http.StatusBadRequest)
-		return
+		req.BLeg = "&park()"
 	}
 
 	// Build channel variables string
-	var channelVars string
+	// Start with user-provided channel variables
+	vars := []string{}
 	if len(req.ChannelVariables) > 0 {
-		vars := []string{}
 		for key, value := range req.ChannelVariables {
 			switch v := value.(type) {
 			case string:
@@ -645,10 +704,23 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 				vars = append(vars, fmt.Sprintf("%s=%v", key, v))
 			}
 		}
+	}
+
+	// Add caller ID as channel variables (these take precedence)
+	if req.CallerIDNumber != "" {
+		vars = append(vars, fmt.Sprintf("origination_caller_id_number=%s", req.CallerIDNumber))
+	}
+	if req.CallerIDName != "" {
+		// Quote caller ID name in case it contains spaces
+		vars = append(vars, fmt.Sprintf("origination_caller_id_name='%s'", req.CallerIDName))
+	}
+
+	var channelVars string
+	if len(vars) > 0 {
 		channelVars = fmt.Sprintf("{%s}", strings.Join(vars, ","))
 	}
 
-	// Build the originate command
+	// Build the originate command: originate {vars}aleg bleg [dialplan] [context] [cid_name] [cid_num] [timeout]
 	var cmd strings.Builder
 	cmd.WriteString("api originate ")
 
@@ -664,7 +736,10 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 	// Add B-leg (can be extension or &application)
 	cmd.WriteString(req.BLeg)
 
-	// Add optional parameters
+	// Add optional parameters in order: dialplan, context, cid_name, cid_num, timeout
+	// Note: When using channel variables for caller ID (origination_caller_id_*),
+	// we include them here only if NOT already in the channel variables
+
 	if req.Dialplan != "" {
 		cmd.WriteString(" ")
 		cmd.WriteString(req.Dialplan)
@@ -675,16 +750,19 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 		cmd.WriteString(req.Context)
 	}
 
-	if req.CallerIDName != "" {
+	// Add cid_name or skip it
+	if req.CallerIDName != "" && !strings.Contains(channelVars, "origination_caller_id_name") {
 		cmd.WriteString(" ")
 		cmd.WriteString(req.CallerIDName)
 	}
 
-	if req.CallerIDNumber != "" {
+	// Add cid_num or skip it
+	if req.CallerIDNumber != "" && !strings.Contains(channelVars, "origination_caller_id_number") {
 		cmd.WriteString(" ")
 		cmd.WriteString(req.CallerIDNumber)
 	}
 
+	// Add timeout if specified
 	if req.TimeoutSec > 0 {
 		cmd.WriteString(" ")
 		cmd.WriteString(fmt.Sprintf("%d", req.TimeoutSec))
