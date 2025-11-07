@@ -803,7 +803,8 @@ func (h *APIHandler) GetCallDetails(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Step 1: Get call information to extract both A-leg and B-leg UUIDs
-	showCallsCmd := fmt.Sprintf("api show calls as json where uuid='%s'", callUUID)
+	// Note: FreeSWITCH "show calls" doesn't support WHERE clause, so we get all calls and filter
+	showCallsCmd := "api show calls as json"
 	callsResponse, err := h.eslClient.SendCommand(showCallsCmd)
 	if err != nil {
 		statusCode := h.getErrorStatusCode(err)
@@ -825,14 +826,30 @@ func (h *APIHandler) GetCallDetails(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Find the specific call by UUID (check both A-leg and B-leg UUIDs)
+	var aLegUUID, bLegUUID string
+	var callFound bool
+	for _, row := range callsData.Rows {
+		if row.UUID == callUUID {
+			// Input UUID matches A-leg
+			aLegUUID = row.UUID
+			bLegUUID = row.BUUID
+			callFound = true
+			break
+		} else if row.BUUID == callUUID {
+			// Input UUID matches B-leg
+			aLegUUID = row.UUID
+			bLegUUID = row.BUUID
+			callFound = true
+			break
+		}
+	}
+
 	// Check if call was found
-	if callsData.RowCount == 0 || len(callsData.Rows) == 0 {
+	if !callFound {
 		h.respondError(w, r, fmt.Sprintf("Call %s not found", callUUID), http.StatusNotFound)
 		return
 	}
-
-	aLegUUID := callsData.Rows[0].UUID
-	bLegUUID := callsData.Rows[0].BUUID
 
 	// Step 3: Dump A-leg details
 	aLegDumpCmd := fmt.Sprintf("api uuid_dump %s", aLegUUID)
