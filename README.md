@@ -11,6 +11,10 @@ This service provides a simple, stateless HTTP API for controlling FreeSWITCH ca
 - **11 API Endpoints**: 9 Call Control + 2 Query endpoints
   - Call Control: Hangup, Transfer, Bridge, Answer, Hold/Unhold, Record, DTMF, Park, Originate
   - Query: Call Details, FreeSWITCH Status
+- **Context-Based Authorization**: Optional multi-tenant security via `X-Allowed-Contexts` header
+  - Restrict operations by FreeSWITCH context (e.g., domain/tenant)
+  - Wildcard `*` support for super admin access
+  - Backward compatible (no header = unrestricted access)
 - **RESTful Design**: Clean JSON API following OpenAPI 3.0 specification
 - **Production Ready**: UUID validation, request tracing, structured logging, graceful shutdown
 - **Systemd Integration**: Runs as a system service with automatic restart
@@ -148,6 +152,124 @@ journalctl -u fs-api.service -n 100
 # View logs since boot
 journalctl -u fs-api.service -b
 ```
+
+## Authorization
+
+### Context-Based Authorization
+
+All call control and query endpoints support optional context-based authorization via the `X-Allowed-Contexts` header. This enables multi-tenant security by restricting API operations to specific FreeSWITCH contexts (domains/tenants).
+
+#### Header Format
+
+```
+X-Allowed-Contexts: context1,context2,context3
+```
+
+Or for super admin access:
+```
+X-Allowed-Contexts: *
+```
+
+#### Authorization Modes
+
+| Header Value | Behavior | Use Case |
+|-------------|----------|----------|
+| *(empty/missing)* | Unrestricted access | Internal API calls, backward compatibility |
+| `*` | Unrestricted access (explicit) | Super admin, monitoring tools |
+| `context1.com` | Single context only | Regular user assigned to one tenant |
+| `context1.com,context2.com` | Multiple contexts | User managing multiple tenants |
+
+#### How It Works
+
+When a request includes the `X-Allowed-Contexts` header:
+
+1. **Call operations** (hangup, transfer, hold, etc.): The API checks the call's `accountcode` field (which contains the FreeSWITCH context) and verifies it matches one of the allowed contexts
+2. **Originate operations**: The API validates the requested `context` parameter against allowed contexts
+3. **Bridge operations**: Both call UUIDs are validated against allowed contexts
+
+#### Examples
+
+**Unrestricted access (no header)**:
+```bash
+curl http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcdef
+```
+
+**Super admin with wildcard**:
+```bash
+curl -H "X-Allowed-Contexts: *" \
+  http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcdef
+```
+
+**Single context restriction**:
+```bash
+curl -H "X-Allowed-Contexts: customer1.example.com" \
+  -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcdef/hangup
+```
+
+**Multiple contexts**:
+```bash
+curl -H "X-Allowed-Contexts: customer1.example.com,customer2.example.com" \
+  http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcdef
+```
+
+**Originate with context validation**:
+```bash
+curl -H "X-Allowed-Contexts: customer1.example.com" \
+  -X POST http://localhost:37274/v1/calls/originate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "aleg": "user/1000",
+    "bleg": "&park()",
+    "context": "customer1.example.com"
+  }'
+```
+
+#### Error Responses
+
+**Call not found**:
+```json
+{
+  "status": "error",
+  "message": "Call a1b2c3d4-e5f6-7890-1234-567890abcdef not found"
+}
+```
+
+**Unauthorized context (403 Forbidden)**:
+```json
+{
+  "status": "error",
+  "message": "Call a1b2c3d4-e5f6-7890-1234-567890abcdef belongs to context 'customer2.example.com' which is not in your allowed contexts: [customer1.example.com]"
+}
+```
+
+**Originate with unauthorized context**:
+```json
+{
+  "status": "error",
+  "message": "Cannot originate call in context 'customer2.example.com' - not in your allowed contexts: [customer1.example.com]"
+}
+```
+
+#### Protected Endpoints
+
+The following endpoints enforce context authorization when `X-Allowed-Contexts` header is present:
+
+- ✅ `GET /v1/calls/{uuid}` - Get call details
+- ✅ `POST /v1/calls/{uuid}/hangup` - Hangup call
+- ✅ `POST /v1/calls/{uuid}/transfer` - Transfer call
+- ✅ `POST /v1/calls/{uuid}/answer` - Answer call
+- ✅ `POST /v1/calls/{uuid}/hold` - Hold/unhold call
+- ✅ `POST /v1/calls/{uuid}/record` - Start/stop recording
+- ✅ `POST /v1/calls/{uuid}/dtmf` - Send DTMF
+- ✅ `POST /v1/calls/{uuid}/park` - Park call
+- ✅ `POST /v1/calls/bridge` - Bridge two calls (validates both UUIDs)
+- ✅ `POST /v1/calls/originate` - Originate call (validates context parameter)
+
+**Unprotected Endpoints** (system-level, no context validation):
+- `GET /v1/status` - FreeSWITCH status
+- `GET /health` - Health check
+
+---
 
 ## API Endpoints
 
@@ -751,10 +873,16 @@ All endpoints return error responses in the following format:
 ### Project Structure
 ```
 /root/fs-api/
-├── main.go           # Main application code
+├── main.go           # Server initialization and routing
+├── handlers.go       # API endpoint handlers
+├── auth.go           # Context authorization logic
+├── middleware.go     # HTTP middleware functions
+├── types.go          # Request/response structures
+├── esl.go            # FreeSWITCH ESL client
+├── utils.go          # Validation and logging helpers
 ├── go.mod            # Go module definition
 ├── go.sum            # Go dependencies checksums
-├── fs-api            # Compiled binary
+├── DEVELOPMENT.md    # Development guide
 └── README.md         # This file
 ```
 
@@ -771,8 +899,8 @@ If you need to rebuild the application:
 git clone https://github.com/emaktel/fs-api.git
 cd fs-api
 
-# Build the binary
-go build -o fs-api main.go
+# Build the binary (compiles all .go files)
+go build -o fs-api
 
 # Install it
 sudo mv fs-api /usr/local/bin/fs-api
@@ -815,11 +943,12 @@ ss -tlnp | grep 37274
 
 ## Security Considerations
 
-- The service binds to `localhost` only for security
-- To expose externally, modify the bind address in `main.go` and add proper authentication
-- Consider implementing API key authentication for production use
-- Use HTTPS/TLS for encrypted communication
-- Implement rate limiting to prevent abuse
+- **Context-Based Authorization**: Use the `X-Allowed-Contexts` header to restrict API operations by FreeSWITCH context/tenant
+- **Network Binding**: The service binds to all interfaces (0.0.0.0) by default - use a reverse proxy or firewall for external access control
+- **Authentication Proxy**: Deploy behind an authentication proxy that sets the `X-Allowed-Contexts` header based on user permissions
+- **HTTPS/TLS**: Use a reverse proxy (nginx, Caddy) to add HTTPS encryption
+- **Rate Limiting**: Implement rate limiting at the reverse proxy level to prevent abuse
+- **ESL Password**: Change the default FreeSWITCH ESL password from "ClueCon" in production
 
 ## License
 

@@ -5,14 +5,14 @@ FreeSWITCH Call Control API (fs-api) - A Go-based REST API for controlling FreeS
 
 ## Quick Start Development
 
-1. **Edit code** in `main.go`
+1. **Edit code** in `.go` files
 2. **Deploy and test** by running: `./dev-deploy.sh`
 3. **Commit when ready** using git
 
 ## How It Works
 
 - **Language**: Go 1.25.0
-- **Main file**: `main.go`
+- **Source files**: `*.go` (main.go, handlers.go, auth.go, middleware.go, types.go, esl.go, utils.go)
 - **Build output**: `builds/` folder (git-ignored)
 - **Service**: Managed by systemd as `fs-api`
 - **Port**: 37274 (configurable via `FSAPI_PORT` env var)
