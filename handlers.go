@@ -582,6 +582,80 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GET /v1/calls
+func (h *APIHandler) ListCalls(w http.ResponseWriter, r *http.Request) {
+	requestID := getRequestID(r)
+
+	// Check if X-Allowed-Contexts header is present
+	allowedContextsHeader := r.Header.Get("X-Allowed-Contexts")
+	if allowedContextsHeader == "" {
+		h.respondError(w, r, "X-Allowed-Contexts header is required for this endpoint", http.StatusBadRequest)
+		return
+	}
+
+	// Get allowed contexts from the middleware
+	allowedContexts := getAllowedContexts(r)
+	unrestricted := isUnrestrictedAccess(r)
+
+	// Step 1: Get all calls from FreeSWITCH
+	showCallsCmd := "api show calls as json"
+	callsResponse, err := h.eslClient.SendCommand(showCallsCmd)
+	if err != nil {
+		statusCode := h.getErrorStatusCode(err)
+		h.respondError(w, r, fmt.Sprintf("Failed to retrieve calls: %v", err), statusCode)
+		return
+	}
+
+	// Step 2: Parse JSON response
+	var callsData struct {
+		RowCount int                      `json:"row_count"`
+		Rows     []map[string]interface{} `json:"rows"`
+	}
+
+	if err := json.Unmarshal([]byte(callsResponse), &callsData); err != nil {
+		h.respondError(w, r, fmt.Sprintf("Failed to parse calls data: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Step 3: Filter calls based on allowed contexts
+	var filteredCalls []map[string]interface{}
+
+	if unrestricted {
+		// Wildcard or no restrictions - return all calls
+		filteredCalls = callsData.Rows
+		logInfo(requestID, fmt.Sprintf("Retrieved all calls (unrestricted access): %d calls", len(filteredCalls)))
+	} else {
+		// Filter by allowed contexts
+		for _, call := range callsData.Rows {
+			// Get accountcode from the call
+			accountcode, ok := call["accountcode"].(string)
+			if !ok {
+				// If accountcode is missing, skip this call
+				continue
+			}
+
+			// Check if this call's context is in the allowed list
+			for _, allowed := range allowedContexts {
+				if accountcode == allowed {
+					filteredCalls = append(filteredCalls, call)
+					break
+				}
+			}
+		}
+		logInfo(requestID, fmt.Sprintf("Retrieved filtered calls for contexts %v: %d calls", allowedContexts, len(filteredCalls)))
+	}
+
+	// Step 4: Return the filtered calls
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Request-ID", requestID)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "success",
+		"row_count": len(filteredCalls),
+		"rows":      filteredCalls,
+	})
+}
+
 // GET /v1/calls/{uuid}
 func (h *APIHandler) GetCallDetails(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)

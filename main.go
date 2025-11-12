@@ -44,6 +44,7 @@ func main() {
 	v1.HandleFunc("/calls/{uuid}/dtmf", handler.SendDTMF).Methods("POST")
 	v1.HandleFunc("/calls/{uuid}/park", handler.ParkCall).Methods("POST")
 	v1.HandleFunc("/calls/originate", handler.OriginateCall).Methods("POST")
+	v1.HandleFunc("/calls", handler.ListCalls).Methods("GET")
 	v1.HandleFunc("/calls/{uuid}", handler.GetCallDetails).Methods("GET")
 	v1.HandleFunc("/status", handler.GetStatus).Methods("GET")
 

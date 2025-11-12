@@ -8,9 +8,9 @@ This service provides a simple, stateless HTTP API for controlling FreeSWITCH ca
 
 ## Features
 
-- **11 API Endpoints**: 9 Call Control + 2 Query endpoints
+- **12 API Endpoints**: 9 Call Control + 3 Query endpoints
   - Call Control: Hangup, Transfer, Bridge, Answer, Hold/Unhold, Record, DTMF, Park, Originate
-  - Query: Call Details, FreeSWITCH Status
+  - Query: List Calls, Call Details, FreeSWITCH Status
 - **Context-Based Authorization**: Optional multi-tenant security via `X-Allowed-Contexts` header
   - Restrict operations by FreeSWITCH context (e.g., domain/tenant)
   - Wildcard `*` support for super admin access
@@ -293,7 +293,111 @@ curl http://localhost:37274/health
 
 ---
 
-### 1. Get Call Details
+### 1. List All Calls
+Retrieve a list of all active calls, filtered by allowed contexts.
+
+```bash
+GET /v1/calls
+```
+
+**Required Header**:
+```
+X-Allowed-Contexts: context1,context2,* (required)
+```
+
+**Description**: This endpoint returns all active calls filtered by the `X-Allowed-Contexts` header. The header is **mandatory** for this endpoint:
+- `X-Allowed-Contexts: *` - Returns all active calls (super admin/unrestricted access)
+- `X-Allowed-Contexts: context1.com` - Returns calls belonging to a single context
+- `X-Allowed-Contexts: context1.com,context2.com` - Returns calls belonging to any of the specified contexts
+
+**Examples**:
+
+**Get all calls (unrestricted)**:
+```bash
+curl -H "X-Allowed-Contexts: *" http://localhost:37274/v1/calls
+```
+
+**Get calls for specific context**:
+```bash
+curl -H "X-Allowed-Contexts: customer1.example.com" http://localhost:37274/v1/calls
+```
+
+**Get calls for multiple contexts**:
+```bash
+curl -H "X-Allowed-Contexts: customer1.example.com,customer2.example.com" http://localhost:37274/v1/calls
+```
+
+**Response (Success)**:
+```json
+{
+  "status": "success",
+  "row_count": 2,
+  "rows": [
+    {
+      "uuid": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+      "direction": "inbound",
+      "created": "2025-11-07 17:47:10",
+      "created_epoch": "1762555630",
+      "name": "sofia/internal/100@domain.com",
+      "state": "CS_EXECUTE",
+      "cid_name": "100",
+      "cid_num": "100",
+      "dest": "5146272886",
+      "callstate": "ACTIVE",
+      "accountcode": "customer1.example.com",
+      "b_uuid": "e5f6-7890-1234-5678-90abcdef1234",
+      "b_direction": "outbound",
+      "b_created": "2025-11-07 17:47:10",
+      "b_name": "sofia/external/+15551234567",
+      "b_state": "CS_EXCHANGE_MEDIA",
+      "b_cid_name": "Caller",
+      "b_cid_num": "+15551234567",
+      "b_callstate": "ACTIVE"
+    },
+    {
+      "uuid": "b2c3d4e5-f6-7890-1234-567890abcdef2",
+      "direction": "inbound",
+      "created": "2025-11-07 17:48:15",
+      "created_epoch": "1762555695",
+      "name": "sofia/internal/101@domain.com",
+      "state": "CS_EXECUTE",
+      "cid_name": "101",
+      "cid_num": "101",
+      "dest": "5146272887",
+      "callstate": "ACTIVE",
+      "accountcode": "customer1.example.com",
+      "b_uuid": ""
+    }
+  ]
+}
+```
+
+**Error Response (Missing Header)**:
+```json
+{
+  "status": "error",
+  "message": "X-Allowed-Contexts header is required for this endpoint"
+}
+```
+
+**Error Response (Unauthorized Context)**:
+```json
+{
+  "status": "error",
+  "message": "Call a1b2c3d4-e5f6-7890-1234-567890abcdef belongs to context 'other.example.com' which is not in your allowed contexts: [customer1.example.com]"
+}
+```
+
+**Notes**:
+- `row_count` shows the number of calls returned
+- `rows` contains the list of all active calls matching the allowed contexts
+- Each row contains call summary information from FreeSWITCH's `show calls` output
+- Empty `rows` list means no active calls match the specified contexts
+- This endpoint requires the `X-Allowed-Contexts` header (unlike other endpoints where it's optional)
+
+---
+
+### 2. Get Call Details
 Retrieve complete call information including both A-leg and B-leg details.
 
 ```bash
@@ -412,7 +516,7 @@ curl http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcdef
 
 ---
 
-### 2. Hangup Call
+### 3. Hangup Call
 Terminate a specific call leg.
 
 ```bash
@@ -443,7 +547,7 @@ curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcde
 
 ---
 
-### 3. Transfer Call
+### 4. Transfer Call
 Transfer a call to a new destination in the dialplan. Supports transferring A-leg (default), B-leg, or both legs.
 
 ```bash
@@ -506,7 +610,7 @@ curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcde
 
 ---
 
-### 4. Bridge Calls
+### 5. Bridge Calls
 Bridge two separate call legs together.
 
 ```bash
@@ -538,7 +642,7 @@ curl -X POST http://localhost:37274/v1/calls/bridge \
 
 ---
 
-### 5. Answer Call
+### 6. Answer Call
 Answer a ringing call.
 
 ```bash
@@ -560,7 +664,7 @@ curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcde
 
 ---
 
-### 6. Hold/Unhold Call
+### 7. Hold/Unhold Call
 Place a call on hold or unhold it.
 
 ```bash
@@ -599,7 +703,7 @@ curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcde
 
 ---
 
-### 7. Record Call
+### 8. Record Call
 Start or stop recording a call.
 
 ```bash
@@ -644,7 +748,7 @@ curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcde
 
 ---
 
-### 8. Send DTMF
+### 9. Send DTMF
 Send DTMF digits to a call leg.
 
 ```bash
@@ -679,7 +783,7 @@ curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcde
 
 ---
 
-### 9. Park Call
+### 10. Park Call
 Park a specific call leg.
 
 ```bash
@@ -701,7 +805,7 @@ curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcde
 
 ---
 
-### 10. Originate Call
+### 11. Originate Call
 Initiate a new call between two endpoints.
 
 ```bash
@@ -780,7 +884,7 @@ curl -X POST http://localhost:37274/v1/calls/originate \
 
 ---
 
-### 11. Get FreeSWITCH Status
+### 12. Get FreeSWITCH Status
 Retrieve detailed status information from the FreeSWITCH server.
 
 ```bash
