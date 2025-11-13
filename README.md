@@ -47,7 +47,7 @@ Download the binary for your platform from [releases](https://github.com/emaktel
 
 ```bash
 # Linux AMD64
-wget https://github.com/emaktel/fs-api/releases/download/v0.1.0/fs-api-linux-amd64
+wget https://github.com/emaktel/fs-api/releases/download/v0.2.0/fs-api-linux-amd64
 chmod +x fs-api-linux-amd64
 sudo mv fs-api-linux-amd64 /usr/local/bin/fs-api
 
@@ -287,7 +287,7 @@ curl http://localhost:37274/health
 ```json
 {
   "status": "healthy",
-  "version": "0.1.0"
+  "version": "0.2.0"
 }
 ```
 
