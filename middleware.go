@@ -41,16 +41,9 @@ func isLocalhost(r *http.Request) bool {
 }
 
 // bearerAuthMiddleware validates bearer token authentication
-// Allows requests from localhost to bypass authentication
 func bearerAuthMiddleware(allowedTokens []string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Allow localhost requests without authentication
-			if isLocalhost(r) {
-				next.ServeHTTP(w, r)
-				return
-			}
-
 			// If no tokens configured, allow all requests (backward compatibility)
 			if len(allowedTokens) == 0 {
 				next.ServeHTTP(w, r)

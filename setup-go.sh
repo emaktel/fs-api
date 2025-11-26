@@ -117,17 +117,31 @@ if [ -f "$HOME/.zshrc" ] && ! grep -q "go/bin" "$HOME/.bashrc"; then
 fi
 
 echo -e "${YELLOW}Setting up PATH...${NC}"
+
+# Configure system-wide PATH (affects all users and new sessions)
+if [ ! -f /etc/profile.d/go.sh ]; then
+    echo "  Creating system-wide Go PATH configuration"
+    $SUDO tee /etc/profile.d/go.sh > /dev/null << 'EOF'
+# Go installation PATH
+export PATH=/usr/local/go/bin:$PATH
+EOF
+    $SUDO chmod +x /etc/profile.d/go.sh
+else
+    echo "  System-wide Go PATH already configured"
+fi
+
+# Also update user shell config for backward compatibility
 if ! grep -q "/usr/local/go/bin" "$SHELL_RC"; then
     echo "  Adding Go to $SHELL_RC"
     echo "" >> "$SHELL_RC"
     echo "# Go installation" >> "$SHELL_RC"
-    echo "export PATH=\$PATH:/usr/local/go/bin" >> "$SHELL_RC"
+    echo "export PATH=/usr/local/go/bin:\$PATH" >> "$SHELL_RC"
 else
     echo "  Go PATH already configured in $SHELL_RC"
 fi
 
-# Add to current shell session
-export PATH=$PATH:/usr/local/go/bin
+# Add to current shell session (prepend to take precedence)
+export PATH=/usr/local/go/bin:$PATH
 
 echo -e "${GREEN}✓ PATH configured${NC}"
 echo ""

@@ -74,10 +74,9 @@ func main() {
 	// Log authentication status
 	if len(authTokens) > 0 {
 		log.Printf("Bearer token authentication: ENABLED (%d token(s) configured)", len(authTokens))
-		log.Printf("Note: Localhost requests bypass authentication")
 	} else {
 		log.Printf("Bearer token authentication: DISABLED (no tokens configured)")
-		log.Printf("WARNING: API is accessible without authentication from remote hosts")
+		log.Printf("WARNING: API is accessible without authentication")
 	}
 
 	// Configure HTTP server with timeouts
