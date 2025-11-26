@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # FreeSWITCH Call Control API Installation Script
-# Version: 0.1.0
+# Version: 0.2.0
 
 set -e
 
@@ -27,7 +27,7 @@ esac
 
 # Set binary name
 BINARY_NAME="fs-api-${OS}-${ARCH}"
-RELEASE_URL="https://github.com/emaktel/fs-api/releases/download/v0.1.0/${BINARY_NAME}"
+RELEASE_URL="https://github.com/emaktel/fs-api/releases/download/v0.2.0/${BINARY_NAME}"
 
 echo "Detected: ${OS} ${ARCH}"
 echo "Downloading ${BINARY_NAME}..."
