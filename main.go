@@ -7,28 +7,43 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/mux"
 )
 
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 var (
-	FSAPI_PORT   = getEnv("FSAPI_PORT", "37274")
-	ESL_HOST     = getEnv("ESL_HOST", "localhost")
-	ESL_PORT     = getEnv("ESL_PORT", "8021")
-	ESL_PASSWORD = getEnv("ESL_PASSWORD", "ClueCon")
+	FSAPI_PORT        = getEnv("FSAPI_PORT", "37274")
+	ESL_HOST          = getEnv("ESL_HOST", "localhost")
+	ESL_PORT          = getEnv("ESL_PORT", "8021")
+	ESL_PASSWORD      = getEnv("ESL_PASSWORD", "ClueCon")
+	FSAPI_AUTH_TOKENS = getEnv("FSAPI_AUTH_TOKENS", "")
 )
 
 func main() {
 	handler := NewAPIHandler(ESL_HOST, ESL_PORT, ESL_PASSWORD)
 
+	// Parse authentication tokens
+	var authTokens []string
+	if FSAPI_AUTH_TOKENS != "" {
+		tokens := strings.Split(FSAPI_AUTH_TOKENS, ",")
+		for _, token := range tokens {
+			trimmed := strings.TrimSpace(token)
+			if trimmed != "" {
+				authTokens = append(authTokens, trimmed)
+			}
+		}
+	}
+
 	r := mux.NewRouter()
 
-	// Apply middlewares
+	// Apply middlewares (auth must be first)
 	r.Use(requestIDMiddleware)
+	r.Use(bearerAuthMiddleware(authTokens))
 	r.Use(contextAuthMiddleware)
 	r.Use(requestSizeLimitMiddleware)
 
@@ -55,6 +70,15 @@ func main() {
 	addr := fmt.Sprintf(":%s", FSAPI_PORT)
 	log.Printf("FreeSWITCH Call Control API v%s starting on %s (all interfaces)", Version, addr)
 	log.Printf("ESL configured for %s:%s", ESL_HOST, ESL_PORT)
+
+	// Log authentication status
+	if len(authTokens) > 0 {
+		log.Printf("Bearer token authentication: ENABLED (%d token(s) configured)", len(authTokens))
+		log.Printf("Note: Localhost requests bypass authentication")
+	} else {
+		log.Printf("Bearer token authentication: DISABLED (no tokens configured)")
+		log.Printf("WARNING: API is accessible without authentication from remote hosts")
+	}
 
 	// Configure HTTP server with timeouts
 	srv := &http.Server{

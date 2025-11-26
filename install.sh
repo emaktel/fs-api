@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # FreeSWITCH Call Control API Installation Script
-# Version: 0.2.0
+# Version: 0.3.0
 # This script will:
 # 1. Try to download and use pre-built binary
 # 2. If that fails (GLIBC issues), install Go and build from source
@@ -14,7 +14,43 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# Parse command line arguments
+API_KEY=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --api-key)
+            API_KEY="$2"
+            shift 2
+            ;;
+        *)
+            echo -e "${RED}Unknown option: $1${NC}"
+            echo "Usage: $0 [--api-key <token>]"
+            exit 1
+            ;;
+    esac
+done
+
 echo -e "${YELLOW}Installing FreeSWITCH Call Control API...${NC}"
+echo ""
+
+# Prompt for API key if not provided via flag
+if [ -z "$API_KEY" ]; then
+    echo -e "${YELLOW}Bearer Token Authentication Setup${NC}"
+    echo "To secure your API, you must provide an authentication token."
+    echo "This token will be required for all API requests from remote hosts."
+    echo ""
+    read -p "Enter API authentication token: " API_KEY
+    echo ""
+
+    # Validate that API key is not empty
+    if [ -z "$API_KEY" ]; then
+        echo -e "${RED}✗ API token cannot be empty${NC}"
+        echo "Installation aborted. Please run the script again with a valid token."
+        exit 1
+    fi
+fi
+
+echo -e "${GREEN}✓ API token configured${NC}"
 echo ""
 
 # Detect OS and architecture
@@ -74,22 +110,27 @@ build_from_source() {
         echo ""
     fi
 
-    # Verify Go is available
-    if ! command -v go &> /dev/null; then
-        # Try adding to PATH
-        export PATH=$PATH:/usr/local/go/bin
-        if ! command -v go &> /dev/null; then
-            echo -e "${RED}✗ Go installation failed or not in PATH${NC}"
-            exit 1
-        fi
+    # Verify Go is available and use explicit path
+    GO_BIN="/usr/local/go/bin/go"
+    if [ ! -f "$GO_BIN" ]; then
+        echo -e "${RED}✗ Go installation failed - binary not found at $GO_BIN${NC}"
+        exit 1
     fi
 
-    # Build the application
+    # Verify correct Go version is installed
+    INSTALLED_GO_VERSION=$($GO_BIN version | awk '{print $3}' | sed 's/go//')
+    if [ "$INSTALLED_GO_VERSION" != "$REQUIRED_GO_VERSION" ]; then
+        echo -e "${RED}✗ Go version mismatch. Expected $REQUIRED_GO_VERSION, got $INSTALLED_GO_VERSION${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ Using Go $INSTALLED_GO_VERSION${NC}"
+
+    # Build the application using explicit Go path
     echo -e "${YELLOW}Compiling fs-api...${NC}"
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     cd "$SCRIPT_DIR"
 
-    if ! go build -o fs-api; then
+    if ! $GO_BIN build -o fs-api; then
         echo -e "${RED}✗ Build failed${NC}"
         exit 1
     fi
@@ -101,7 +142,7 @@ build_from_source() {
 # Try downloading pre-built binary first
 USE_PREBUILT=true
 BINARY_NAME="fs-api-${OS}-${ARCH}"
-RELEASE_URL="https://github.com/emaktel/fs-api/releases/download/v0.2.0/${BINARY_NAME}"
+RELEASE_URL="https://github.com/emaktel/fs-api/releases/download/v0.3.0/${BINARY_NAME}"
 
 echo -e "${YELLOW}Attempting to download pre-built binary...${NC}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -166,7 +207,16 @@ sudo mv fs-api /usr/local/bin/fs-api
 # Install systemd service if on Linux
 if [ "$OS" = "linux" ]; then
     echo -e "${YELLOW}Installing systemd service...${NC}"
-    sudo cp fs-api.service /etc/systemd/system/fs-api.service
+
+    # Create a temporary copy of the service file and add the API token
+    cp fs-api.service /tmp/fs-api.service.tmp
+
+    # Add Environment line after the WorkingDirectory line
+    sed -i "/^WorkingDirectory=/a Environment=\"FSAPI_AUTH_TOKENS=${API_KEY}\"" /tmp/fs-api.service.tmp
+
+    # Copy modified service file to systemd
+    sudo mv /tmp/fs-api.service.tmp /etc/systemd/system/fs-api.service
+
     sudo systemctl daemon-reload
     sudo systemctl enable fs-api.service
     echo -e "${GREEN}✓ Service installed and enabled${NC}"
@@ -195,8 +245,15 @@ if [ "$OS" = "linux" ]; then
     echo "  API Base:      http://localhost:37274/v1"
     echo "  Health Check:  http://localhost:37274/health"
     echo ""
-    echo -e "${YELLOW}Test the API:${NC}"
+    echo -e "${YELLOW}Authentication:${NC}"
+    echo "  Remote requests require Bearer token authentication"
+    echo "  Localhost requests bypass authentication"
+    echo ""
+    echo -e "${YELLOW}Test the API (from localhost):${NC}"
     echo "  curl http://localhost:37274/health"
+    echo ""
+    echo -e "${YELLOW}Test the API (with authentication):${NC}"
+    echo "  curl -H \"Authorization: Bearer ${API_KEY}\" http://localhost:37274/health"
 else
     echo -e "${GREEN}✓ Binary installed successfully${NC}"
     echo ""
@@ -205,15 +262,20 @@ else
     echo -e "${GREEN}╚════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "${YELLOW}To run the API:${NC}"
-    echo "  fs-api"
+    echo "  FSAPI_AUTH_TOKENS=\"${API_KEY}\" fs-api"
     echo ""
     echo -e "${YELLOW}Configuration (Environment Variables):${NC}"
     echo "  FSAPI_PORT=37274"
     echo "  ESL_HOST=localhost"
     echo "  ESL_PORT=8021"
     echo "  ESL_PASSWORD=ClueCon"
+    echo "  FSAPI_AUTH_TOKENS=${API_KEY}"
     echo ""
     echo -e "${YELLOW}API Endpoints:${NC}"
     echo "  API Base:      http://localhost:37274/v1"
     echo "  Health Check:  http://localhost:37274/health"
+    echo ""
+    echo -e "${YELLOW}Authentication:${NC}"
+    echo "  Remote requests require Bearer token authentication"
+    echo "  Localhost requests bypass authentication"
 fi

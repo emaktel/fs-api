@@ -11,6 +11,10 @@ This service provides a simple, stateless HTTP API for controlling FreeSWITCH ca
 - **12 API Endpoints**: 9 Call Control + 3 Query endpoints
   - Call Control: Hangup, Transfer, Bridge, Answer, Hold/Unhold, Record, DTMF, Park, Originate
   - Query: List Calls, Call Details, FreeSWITCH Status
+- **Bearer Token Authentication**: Secure remote access with configurable API tokens
+  - Localhost requests bypass authentication for convenience
+  - Multiple token support for different clients/users
+  - Optional and backward compatible
 - **Context-Based Authorization**: Optional multi-tenant security via `X-Allowed-Contexts` header
   - Restrict operations by FreeSWITCH context (e.g., domain/tenant)
   - Wildcard `*` support for super admin access
@@ -47,7 +51,7 @@ Download the binary for your platform from [releases](https://github.com/emaktel
 
 ```bash
 # Linux AMD64
-wget https://github.com/emaktel/fs-api/releases/download/v0.2.0/fs-api-linux-amd64
+wget https://github.com/emaktel/fs-api/releases/download/v0.3.0/fs-api-linux-amd64
 chmod +x fs-api-linux-amd64
 sudo mv fs-api-linux-amd64 /usr/local/bin/fs-api
 
@@ -77,6 +81,34 @@ The API can be configured using environment variables. If environment variables 
 | `ESL_HOST` | FreeSWITCH ESL host address | `localhost` |
 | `ESL_PORT` | FreeSWITCH ESL port | `8021` |
 | `ESL_PASSWORD` | FreeSWITCH ESL password | `ClueCon` |
+| `FSAPI_AUTH_TOKENS` | Comma-separated Bearer tokens for authentication | *(none)* |
+
+### Bearer Token Authentication
+
+The API supports Bearer token authentication to secure remote access:
+
+- **Localhost Bypass**: Requests from localhost (127.0.0.1, ::1) always bypass authentication
+- **Remote Requests**: Require valid Bearer token when `FSAPI_AUTH_TOKENS` is configured
+- **Multiple Tokens**: Supports comma-separated tokens for different clients/users
+- **Backward Compatible**: If no tokens configured, behaves like version 0.2.0 (no auth required)
+
+**Configuration**:
+```bash
+# Single token
+export FSAPI_AUTH_TOKENS="your-secret-token-here"
+
+# Multiple tokens (comma-separated)
+export FSAPI_AUTH_TOKENS="token1,token2,token3"
+```
+
+**Usage**:
+```bash
+# Localhost - no auth required
+curl http://localhost:37274/v1/status
+
+# Remote - requires Bearer token
+curl -H "Authorization: Bearer your-secret-token-here" http://example.com:37274/v1/status
+```
 
 ### Configuration Examples
 
@@ -87,6 +119,7 @@ export FSAPI_PORT="8080"
 export ESL_HOST="freeswitch.example.com"
 export ESL_PORT="8021"
 export ESL_PASSWORD="MySecurePassword"
+export FSAPI_AUTH_TOKENS="your-secret-token-here"
 
 # Run the service
 fs-api
@@ -101,6 +134,7 @@ Environment="FSAPI_PORT=8080"
 Environment="ESL_HOST=freeswitch.example.com"
 Environment="ESL_PORT=8021"
 Environment="ESL_PASSWORD=MySecurePassword"
+Environment="FSAPI_AUTH_TOKENS=your-secret-token-here"
 ExecStart=/usr/local/bin/fs-api
 ```
 
@@ -287,7 +321,7 @@ curl http://localhost:37274/health
 ```json
 {
   "status": "healthy",
-  "version": "0.2.0"
+  "version": "0.3.0"
 }
 ```
 
@@ -1047,12 +1081,13 @@ ss -tlnp | grep 37274
 
 ## Security Considerations
 
+- **Bearer Token Authentication** (NEW in v0.3.0): Configure `FSAPI_AUTH_TOKENS` to require authentication for remote requests. Generate strong, random tokens (recommended: 32+ characters). Localhost requests bypass authentication for convenience.
 - **Context-Based Authorization**: Use the `X-Allowed-Contexts` header to restrict API operations by FreeSWITCH context/tenant
 - **Network Binding**: The service binds to all interfaces (0.0.0.0) by default - use a reverse proxy or firewall for external access control
-- **Authentication Proxy**: Deploy behind an authentication proxy that sets the `X-Allowed-Contexts` header based on user permissions
-- **HTTPS/TLS**: Use a reverse proxy (nginx, Caddy) to add HTTPS encryption
+- **HTTPS/TLS**: Use a reverse proxy (nginx, Caddy) to add HTTPS encryption for production deployments
 - **Rate Limiting**: Implement rate limiting at the reverse proxy level to prevent abuse
 - **ESL Password**: Change the default FreeSWITCH ESL password from "ClueCon" in production
+- **Token Management**: Rotate authentication tokens periodically and revoke compromised tokens immediately
 
 ## License
 
