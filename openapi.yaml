@@ -1,0 +1,1366 @@
+openapi: 3.0.3
+info:
+  title: FreeSWITCH Call Control API
+  description: |
+    RESTful API for controlling FreeSWITCH calls and managing mod_callcenter
+    resources (queues, agents, tiers, members) via Event Socket Library (ESL).
+
+    ## Authentication
+
+    When `FSAPI_AUTH_TOKENS` is configured, all requests (except from localhost)
+    must include a valid Bearer token in the `Authorization` header.
+
+    ## Multi-Tenant Authorization
+
+    The `X-Allowed-Contexts` header enables per-tenant access control:
+    - **Omitted or empty** — unrestricted access (backward compatible)
+    - **`*`** — explicit unrestricted / super-admin access
+    - **`domain1.com,domain2.com`** — restrict to listed domains
+
+    For call endpoints the domain is matched against the call's `accountcode`.
+    For callcenter endpoints it is matched against the domain portion of
+    queue/tier names (`name@domain`) or the `domain_name=` value inside agent
+    contact strings.
+  version: 0.4.0
+  contact:
+    name: Emaktel
+    url: https://github.com/emaktel/fs-api
+
+servers:
+  - url: http://localhost:37274
+    description: Local development
+
+# ---------------------------------------------------------------------------
+# Security
+# ---------------------------------------------------------------------------
+security:
+  - BearerAuth: []
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        Required for remote requests when FSAPI_AUTH_TOKENS is configured.
+        Localhost requests bypass authentication.
+
+  # -------------------------------------------------------------------------
+  # Headers
+  # -------------------------------------------------------------------------
+  parameters:
+    XAllowedContexts:
+      name: X-Allowed-Contexts
+      in: header
+      required: false
+      description: >
+        Comma-separated list of allowed FreeSWITCH contexts (domains).
+        Use `*` for unrestricted access. Omit for backward-compatible
+        unrestricted access.
+      schema:
+        type: string
+        example: "customer1.example.com,customer2.example.com"
+    XAllowedContextsRequired:
+      name: X-Allowed-Contexts
+      in: header
+      required: true
+      description: >
+        Comma-separated list of allowed contexts. Required for this endpoint.
+        Use `*` for unrestricted access.
+      schema:
+        type: string
+        example: "*"
+    CallUUID:
+      name: uuid
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Call leg UUID
+    QueueName:
+      name: queue_name
+      in: path
+      required: true
+      schema:
+        type: string
+      description: "Queue name in `name@domain` format"
+      example: "support@customer1.example.com"
+    AgentName:
+      name: agent_name
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Agent identifier (UUID)
+      example: "a1b2c3d4-e5f6-7890-1234-567890abcdef"
+
+  # -------------------------------------------------------------------------
+  # Reusable response headers
+  # -------------------------------------------------------------------------
+  headers:
+    X-Request-ID:
+      description: Unique identifier for the request, useful for log correlation
+      schema:
+        type: string
+        format: uuid
+
+  # -------------------------------------------------------------------------
+  # Schemas
+  # -------------------------------------------------------------------------
+  schemas:
+    SuccessMessage:
+      type: object
+      properties:
+        status:
+          type: string
+          example: success
+        message:
+          type: string
+      required: [status, message]
+
+    ErrorMessage:
+      type: object
+      properties:
+        status:
+          type: string
+          example: error
+        message:
+          type: string
+      required: [status, message]
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [healthy, unhealthy]
+        version:
+          type: string
+        error:
+          type: string
+      required: [status, version]
+
+    CallRow:
+      type: object
+      additionalProperties:
+        type: string
+      description: Call summary row from FreeSWITCH `show calls`
+
+    ListCallsResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: success
+        row_count:
+          type: integer
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/CallRow"
+      required: [status, row_count, rows]
+
+    CallDetailsResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: success
+        call_info:
+          type: object
+          additionalProperties: true
+        aleg:
+          type: object
+          properties:
+            uuid:
+              type: string
+            details:
+              type: object
+              additionalProperties: true
+        bleg:
+          type: object
+          properties:
+            uuid:
+              type: string
+            details:
+              type: object
+              additionalProperties: true
+      required: [status, call_info, aleg]
+
+    StatusResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: success
+        data:
+          type: object
+          additionalProperties: true
+      required: [status, data]
+
+    OriginateResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: success
+        data:
+          type: object
+          properties:
+            response:
+              type: string
+              description: Call UUID or job UUID returned by FreeSWITCH
+      required: [status, data]
+
+    # -- Callcenter schemas ------------------------------------------------
+
+    CCListResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: success
+        row_count:
+          type: integer
+        rows:
+          type: array
+          items:
+            type: object
+            additionalProperties:
+              type: string
+      required: [status, row_count, rows]
+
+    CCCountResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: success
+        count:
+          type: integer
+      required: [status, count]
+
+    # -- Request bodies ----------------------------------------------------
+
+    HangupRequest:
+      type: object
+      properties:
+        cause:
+          type: string
+          description: "SIP hangup cause (default: NORMAL_CLEARING)"
+          example: NORMAL_CLEARING
+
+    TransferRequest:
+      type: object
+      required: [destination]
+      properties:
+        destination:
+          type: string
+          description: Destination extension or number
+        leg:
+          type: string
+          enum: [aleg, bleg, both]
+          default: aleg
+        dialplan:
+          type: string
+          description: "Dialplan type (defaults to XML when context is set)"
+        context:
+          type: string
+          description: Dialplan context
+
+    BridgeRequest:
+      type: object
+      required: [uuid_a, uuid_b]
+      properties:
+        uuid_a:
+          type: string
+          format: uuid
+        uuid_b:
+          type: string
+          format: uuid
+
+    HoldRequest:
+      type: object
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum: [hold, unhold]
+
+    RecordRequest:
+      type: object
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum: [start, stop]
+        filename:
+          type: string
+          description: Absolute file path (required for start)
+
+    DTMFRequest:
+      type: object
+      required: [digits]
+      properties:
+        digits:
+          type: string
+          description: DTMF digit sequence
+        duration:
+          type: integer
+          description: "Tone duration in ms (default: 100)"
+
+    OriginateRequest:
+      type: object
+      required: [aleg]
+      properties:
+        aleg:
+          type: string
+          description: A-leg endpoint
+        bleg:
+          type: string
+          description: "B-leg destination (default: &park())"
+        dialplan:
+          type: string
+        context:
+          type: string
+        caller_id_name:
+          type: string
+        caller_id_number:
+          type: string
+        timeout_sec:
+          type: integer
+        channel_variables:
+          type: object
+          additionalProperties: true
+
+    AgentAddRequest:
+      type: object
+      required: [name, type]
+      properties:
+        name:
+          type: string
+          description: Agent identifier (UUID)
+        type:
+          type: string
+          enum: [callback, uuid-standby]
+        domain:
+          type: string
+          description: Domain for authorization validation
+
+    AgentSetRequest:
+      type: object
+      required: [key, value]
+      properties:
+        key:
+          type: string
+          enum:
+            - status
+            - state
+            - contact
+            - type
+            - max_no_answer
+            - wrap_up_time
+            - reject_delay_time
+            - busy_delay_time
+            - ready_time
+        value:
+          type: string
+        domain:
+          type: string
+          description: Domain for authorization validation
+
+    AgentDelRequest:
+      type: object
+      properties:
+        domain:
+          type: string
+          description: Domain for authorization validation
+
+    TierAddRequest:
+      type: object
+      required: [queue, agent]
+      properties:
+        queue:
+          type: string
+          description: "Queue name in `name@domain` format"
+        agent:
+          type: string
+          description: Agent identifier (UUID)
+        level:
+          type: string
+        position:
+          type: string
+
+    TierDelRequest:
+      type: object
+      required: [queue, agent]
+      properties:
+        queue:
+          type: string
+        agent:
+          type: string
+
+    TierSetRequest:
+      type: object
+      required: [queue, agent, key, value]
+      properties:
+        queue:
+          type: string
+        agent:
+          type: string
+        key:
+          type: string
+          enum: [state, level, position]
+        value:
+          type: string
+
+  # -------------------------------------------------------------------------
+  # Reusable responses
+  # -------------------------------------------------------------------------
+  responses:
+    BadRequest:
+      description: Invalid request
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/X-Request-ID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorMessage"
+    Unauthorized:
+      description: Missing or invalid Bearer token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorMessage"
+    Forbidden:
+      description: Domain / context not in allowed list
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/X-Request-ID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorMessage"
+    NotFound:
+      description: Resource not found
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/X-Request-ID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorMessage"
+    BadGateway:
+      description: FreeSWITCH ESL command error
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/X-Request-ID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorMessage"
+    ServiceUnavailable:
+      description: FreeSWITCH ESL connection unavailable
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/X-Request-ID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorMessage"
+
+# ===========================================================================
+# Paths
+# ===========================================================================
+paths:
+  # -------------------------------------------------------------------------
+  # Health
+  # -------------------------------------------------------------------------
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      description: Tests ESL connectivity and returns service health status.
+      security: []
+      operationId: healthCheck
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: ESL connection unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  # -------------------------------------------------------------------------
+  # Status
+  # -------------------------------------------------------------------------
+  /v1/status:
+    get:
+      tags: [Status]
+      summary: Get FreeSWITCH status
+      operationId: getStatus
+      parameters:
+        - $ref: "#/components/parameters/XAllowedContexts"
+      responses:
+        "200":
+          description: FreeSWITCH status retrieved
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  # -------------------------------------------------------------------------
+  # Calls
+  # -------------------------------------------------------------------------
+  /v1/calls:
+    get:
+      tags: [Calls]
+      summary: List all active calls
+      description: >
+        Returns active calls filtered by allowed contexts.
+        The X-Allowed-Contexts header is **required** for this endpoint.
+      operationId: listCalls
+      parameters:
+        - $ref: "#/components/parameters/XAllowedContextsRequired"
+      responses:
+        "200":
+          description: Calls retrieved
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListCallsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/calls/{uuid}:
+    get:
+      tags: [Calls]
+      summary: Get call details
+      description: >
+        Retrieves full A-leg and B-leg channel details for a call.
+        You may query by either leg's UUID.
+      operationId: getCallDetails
+      parameters:
+        - $ref: "#/components/parameters/CallUUID"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      responses:
+        "200":
+          description: Call details retrieved
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CallDetailsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v1/calls/{uuid}/hangup:
+    post:
+      tags: [Calls]
+      summary: Hangup a call
+      operationId: hangupCall
+      parameters:
+        - $ref: "#/components/parameters/CallUUID"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HangupRequest"
+      responses:
+        "200":
+          description: Call hung up
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/calls/{uuid}/transfer:
+    post:
+      tags: [Calls]
+      summary: Transfer a call
+      operationId: transferCall
+      parameters:
+        - $ref: "#/components/parameters/CallUUID"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TransferRequest"
+      responses:
+        "200":
+          description: Call transferred
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/calls/bridge:
+    post:
+      tags: [Calls]
+      summary: Bridge two calls
+      operationId: bridgeCalls
+      parameters:
+        - $ref: "#/components/parameters/XAllowedContexts"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BridgeRequest"
+      responses:
+        "200":
+          description: Calls bridged
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/calls/{uuid}/answer:
+    post:
+      tags: [Calls]
+      summary: Answer a ringing call
+      operationId: answerCall
+      parameters:
+        - $ref: "#/components/parameters/CallUUID"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      responses:
+        "200":
+          description: Call answered
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/calls/{uuid}/hold:
+    post:
+      tags: [Calls]
+      summary: Hold or unhold a call
+      operationId: controlHold
+      parameters:
+        - $ref: "#/components/parameters/CallUUID"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HoldRequest"
+      responses:
+        "200":
+          description: Hold state changed
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/calls/{uuid}/record:
+    post:
+      tags: [Calls]
+      summary: Start or stop call recording
+      operationId: controlRecording
+      parameters:
+        - $ref: "#/components/parameters/CallUUID"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RecordRequest"
+      responses:
+        "200":
+          description: Recording state changed
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/calls/{uuid}/dtmf:
+    post:
+      tags: [Calls]
+      summary: Send DTMF digits
+      operationId: sendDTMF
+      parameters:
+        - $ref: "#/components/parameters/CallUUID"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DTMFRequest"
+      responses:
+        "200":
+          description: DTMF sent
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/calls/{uuid}/park:
+    post:
+      tags: [Calls]
+      summary: Park a call
+      operationId: parkCall
+      parameters:
+        - $ref: "#/components/parameters/CallUUID"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      responses:
+        "200":
+          description: Call parked
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/calls/originate:
+    post:
+      tags: [Calls]
+      summary: Originate a new call
+      operationId: originateCall
+      parameters:
+        - $ref: "#/components/parameters/XAllowedContexts"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OriginateRequest"
+      responses:
+        "200":
+          description: Call originated
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OriginateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  # -------------------------------------------------------------------------
+  # Callcenter — Queues
+  # -------------------------------------------------------------------------
+  /v1/callcenter/queues:
+    get:
+      tags: [Callcenter - Queues]
+      summary: List all queues
+      description: >
+        Returns all callcenter queues. When access is restricted the list is
+        filtered to queues whose `name` field domain matches an allowed context.
+      operationId: ccListQueues
+      parameters:
+        - $ref: "#/components/parameters/XAllowedContexts"
+      responses:
+        "200":
+          description: Queues retrieved
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CCListResponse"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/callcenter/queues/count:
+    get:
+      tags: [Callcenter - Queues]
+      summary: Count queues
+      description: >
+        Returns the total number of queues. For restricted access the count
+        is derived from a filtered list.
+      operationId: ccCountQueues
+      parameters:
+        - $ref: "#/components/parameters/XAllowedContexts"
+      responses:
+        "200":
+          description: Queue count
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CCCountResponse"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/callcenter/queues/{queue_name}/agents:
+    get:
+      tags: [Callcenter - Queues]
+      summary: List agents in a queue
+      operationId: ccListQueueAgents
+      parameters:
+        - $ref: "#/components/parameters/QueueName"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      responses:
+        "200":
+          description: Queue agents retrieved
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CCListResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/callcenter/queues/{queue_name}/agents/count:
+    get:
+      tags: [Callcenter - Queues]
+      summary: Count agents in a queue
+      description: >
+        Returns the number of agents in the queue. Supports an optional
+        `status` query parameter to count only agents with a specific status.
+      operationId: ccCountQueueAgents
+      parameters:
+        - $ref: "#/components/parameters/QueueName"
+        - $ref: "#/components/parameters/XAllowedContexts"
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter agents by status (e.g. Available, Logged Out)
+      responses:
+        "200":
+          description: Agent count
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CCCountResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/callcenter/queues/{queue_name}/members:
+    get:
+      tags: [Callcenter - Queues]
+      summary: List members (callers) in a queue
+      operationId: ccListQueueMembers
+      parameters:
+        - $ref: "#/components/parameters/QueueName"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      responses:
+        "200":
+          description: Queue members retrieved
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CCListResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/callcenter/queues/{queue_name}/members/count:
+    get:
+      tags: [Callcenter - Queues]
+      summary: Count members in a queue
+      operationId: ccCountQueueMembers
+      parameters:
+        - $ref: "#/components/parameters/QueueName"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      responses:
+        "200":
+          description: Member count
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CCCountResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/callcenter/queues/{queue_name}/tiers:
+    get:
+      tags: [Callcenter - Queues]
+      summary: List tiers in a queue
+      operationId: ccListQueueTiers
+      parameters:
+        - $ref: "#/components/parameters/QueueName"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      responses:
+        "200":
+          description: Queue tiers retrieved
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CCListResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/callcenter/queues/{queue_name}/tiers/count:
+    get:
+      tags: [Callcenter - Queues]
+      summary: Count tiers in a queue
+      operationId: ccCountQueueTiers
+      parameters:
+        - $ref: "#/components/parameters/QueueName"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      responses:
+        "200":
+          description: Tier count
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CCCountResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/callcenter/queues/{queue_name}/load:
+    post:
+      tags: [Callcenter - Queues]
+      summary: Load a queue into memory
+      operationId: ccLoadQueue
+      parameters:
+        - $ref: "#/components/parameters/QueueName"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      responses:
+        "200":
+          description: Queue loaded
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/callcenter/queues/{queue_name}/unload:
+    post:
+      tags: [Callcenter - Queues]
+      summary: Unload a queue from memory
+      operationId: ccUnloadQueue
+      parameters:
+        - $ref: "#/components/parameters/QueueName"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      responses:
+        "200":
+          description: Queue unloaded
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/callcenter/queues/{queue_name}/reload:
+    post:
+      tags: [Callcenter - Queues]
+      summary: Reload a queue configuration
+      operationId: ccReloadQueue
+      parameters:
+        - $ref: "#/components/parameters/QueueName"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      responses:
+        "200":
+          description: Queue reloaded
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  # -------------------------------------------------------------------------
+  # Callcenter — Agents
+  # -------------------------------------------------------------------------
+  /v1/callcenter/agents:
+    get:
+      tags: [Callcenter - Agents]
+      summary: List all agents
+      description: >
+        Returns all callcenter agents. When access is restricted the list is
+        filtered by extracting `domain_name=` from each agent's `contact` field.
+      operationId: ccListAgents
+      parameters:
+        - $ref: "#/components/parameters/XAllowedContexts"
+      responses:
+        "200":
+          description: Agents retrieved
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CCListResponse"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    post:
+      tags: [Callcenter - Agents]
+      summary: Add a new agent
+      operationId: ccAddAgent
+      parameters:
+        - $ref: "#/components/parameters/XAllowedContexts"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgentAddRequest"
+      responses:
+        "200":
+          description: Agent added
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  /v1/callcenter/agents/{agent_name}:
+    put:
+      tags: [Callcenter - Agents]
+      summary: Set an agent attribute
+      operationId: ccSetAgent
+      parameters:
+        - $ref: "#/components/parameters/AgentName"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgentSetRequest"
+      responses:
+        "200":
+          description: Agent attribute updated
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+    delete:
+      tags: [Callcenter - Agents]
+      summary: Delete an agent
+      operationId: ccDeleteAgent
+      parameters:
+        - $ref: "#/components/parameters/AgentName"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgentDelRequest"
+      responses:
+        "200":
+          description: Agent deleted
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+  # -------------------------------------------------------------------------
+  # Callcenter — Tiers
+  # -------------------------------------------------------------------------
+  /v1/callcenter/tiers:
+    get:
+      tags: [Callcenter - Tiers]
+      summary: List all tiers
+      description: >
+        Returns all callcenter tiers. When access is restricted the list is
+        filtered by the domain portion of the `queue` field.
+      operationId: ccListTiers
+      parameters:
+        - $ref: "#/components/parameters/XAllowedContexts"
+      responses:
+        "200":
+          description: Tiers retrieved
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CCListResponse"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    post:
+      tags: [Callcenter - Tiers]
+      summary: Add a new tier
+      description: >
+        Creates a tier linking an agent to a queue, optionally with a level
+        and position.
+      operationId: ccAddTier
+      parameters:
+        - $ref: "#/components/parameters/XAllowedContexts"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TierAddRequest"
+      responses:
+        "200":
+          description: Tier added
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+    put:
+      tags: [Callcenter - Tiers]
+      summary: Set a tier attribute
+      operationId: ccSetTier
+      parameters:
+        - $ref: "#/components/parameters/XAllowedContexts"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TierSetRequest"
+      responses:
+        "200":
+          description: Tier attribute updated
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+
+    delete:
+      tags: [Callcenter - Tiers]
+      summary: Delete a tier
+      description: >
+        Removes the tier linking an agent to a queue. Both `queue` and `agent`
+        must be provided in the request body.
+      operationId: ccDeleteTier
+      parameters:
+        - $ref: "#/components/parameters/XAllowedContexts"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TierDelRequest"
+      responses:
+        "200":
+          description: Tier deleted
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "502":
+          $ref: "#/components/responses/BadGateway"

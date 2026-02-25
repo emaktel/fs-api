@@ -14,7 +14,7 @@ import (
 	"github.com/gorilla/mux"
 )
 
-const Version = "0.3.0"
+const Version = "0.4.0"
 
 var (
 	FSAPI_PORT        = getEnv("FSAPI_PORT", "37274")
@@ -62,6 +62,34 @@ func main() {
 	v1.HandleFunc("/calls", handler.ListCalls).Methods("GET")
 	v1.HandleFunc("/calls/{uuid}", handler.GetCallDetails).Methods("GET")
 	v1.HandleFunc("/status", handler.GetStatus).Methods("GET")
+
+	// Callcenter endpoints
+	cc := v1.PathPrefix("/callcenter").Subrouter()
+
+	// Queue endpoints - register /queues/count before /{queue_name} to avoid mux conflicts
+	cc.HandleFunc("/queues", handler.CCListQueues).Methods("GET")
+	cc.HandleFunc("/queues/count", handler.CCCountQueues).Methods("GET")
+	cc.HandleFunc("/queues/{queue_name}/agents", handler.CCListQueueAgents).Methods("GET")
+	cc.HandleFunc("/queues/{queue_name}/agents/count", handler.CCCountQueueAgents).Methods("GET")
+	cc.HandleFunc("/queues/{queue_name}/members", handler.CCListQueueMembers).Methods("GET")
+	cc.HandleFunc("/queues/{queue_name}/members/count", handler.CCCountQueueMembers).Methods("GET")
+	cc.HandleFunc("/queues/{queue_name}/tiers", handler.CCListQueueTiers).Methods("GET")
+	cc.HandleFunc("/queues/{queue_name}/tiers/count", handler.CCCountQueueTiers).Methods("GET")
+	cc.HandleFunc("/queues/{queue_name}/load", handler.CCLoadQueue).Methods("POST")
+	cc.HandleFunc("/queues/{queue_name}/unload", handler.CCUnloadQueue).Methods("POST")
+	cc.HandleFunc("/queues/{queue_name}/reload", handler.CCReloadQueue).Methods("POST")
+
+	// Agent endpoints
+	cc.HandleFunc("/agents", handler.CCListAgents).Methods("GET")
+	cc.HandleFunc("/agents", handler.CCAddAgent).Methods("POST")
+	cc.HandleFunc("/agents/{agent_name}", handler.CCDeleteAgent).Methods("DELETE")
+	cc.HandleFunc("/agents/{agent_name}", handler.CCSetAgent).Methods("PUT")
+
+	// Tier endpoints
+	cc.HandleFunc("/tiers", handler.CCListTiers).Methods("GET")
+	cc.HandleFunc("/tiers", handler.CCAddTier).Methods("POST")
+	cc.HandleFunc("/tiers", handler.CCDeleteTier).Methods("DELETE")
+	cc.HandleFunc("/tiers", handler.CCSetTier).Methods("PUT")
 
 	// Health check endpoint
 	r.HandleFunc("/health", handler.HealthCheck).Methods("GET")

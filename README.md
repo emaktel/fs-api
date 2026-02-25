@@ -8,9 +8,10 @@ This service provides a simple, stateless HTTP API for controlling FreeSWITCH ca
 
 ## Features
 
-- **12 API Endpoints**: 9 Call Control + 3 Query endpoints
+- **31 API Endpoints**: 9 Call Control + 3 Query + 19 Callcenter Management
   - Call Control: Hangup, Transfer, Bridge, Answer, Hold/Unhold, Record, DTMF, Park, Originate
   - Query: List Calls, Call Details, FreeSWITCH Status
+  - Callcenter: Queue CRUD, Agent CRUD, Tier CRUD, Member listing, counts
 - **Bearer Token Authentication**: Secure remote access with configurable API tokens
   - Localhost requests bypass authentication for convenience
   - Multiple token support for different clients/users
@@ -19,7 +20,7 @@ This service provides a simple, stateless HTTP API for controlling FreeSWITCH ca
   - Restrict operations by FreeSWITCH context (e.g., domain/tenant)
   - Wildcard `*` support for super admin access
   - Backward compatible (no header = unrestricted access)
-- **RESTful Design**: Clean JSON API following OpenAPI 3.0 specification
+- **RESTful Design**: Clean JSON API with full [OpenAPI 3.0 specification](openapi.yaml)
 - **Production Ready**: UUID validation, request tracing, structured logging, graceful shutdown
 - **Systemd Integration**: Runs as a system service with automatic restart
 - **Health Monitoring**: Built-in health check endpoint with ESL connection testing
@@ -298,6 +299,12 @@ The following endpoints enforce context authorization when `X-Allowed-Contexts` 
 - ✅ `POST /v1/calls/{uuid}/park` - Park call
 - ✅ `POST /v1/calls/bridge` - Bridge two calls (validates both UUIDs)
 - ✅ `POST /v1/calls/originate` - Originate call (validates context parameter)
+- ✅ All `/v1/callcenter/queues/*` endpoints - Validated by queue `name@domain`
+- ✅ All `/v1/callcenter/agents/*` endpoints - Validated by `domain` in request body (agent names are UUIDs; domain lives in the `contact` field)
+- ✅ All `/v1/callcenter/tiers/*` endpoints - Validated by queue `name@domain`
+- ✅ `GET /v1/callcenter/queues` - List filtered by queue domain
+- ✅ `GET /v1/callcenter/agents` - List filtered by `domain_name=` in agent contact
+- ✅ `GET /v1/callcenter/tiers` - List filtered by queue domain
 
 **Unprotected Endpoints** (system-level, no context validation):
 - `GET /v1/status` - FreeSWITCH status
@@ -321,7 +328,7 @@ curl http://localhost:37274/health
 ```json
 {
   "status": "healthy",
-  "version": "0.3.0"
+  "version": "0.4.0"
 }
 ```
 
@@ -984,6 +991,88 @@ curl http://localhost:37274/v1/status
 
 ---
 
+## Callcenter API Endpoints
+
+> Full details for all callcenter endpoints are in the [OpenAPI spec](openapi.yaml).
+
+### Queue Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/v1/callcenter/queues` | List all queues (filtered by domain) |
+| `GET` | `/v1/callcenter/queues/count` | Count queues |
+| `GET` | `/v1/callcenter/queues/{queue_name}/agents` | List agents in a queue |
+| `GET` | `/v1/callcenter/queues/{queue_name}/agents/count` | Count agents (supports `?status=` filter) |
+| `GET` | `/v1/callcenter/queues/{queue_name}/members` | List members (callers) in a queue |
+| `GET` | `/v1/callcenter/queues/{queue_name}/members/count` | Count members in a queue |
+| `GET` | `/v1/callcenter/queues/{queue_name}/tiers` | List tiers in a queue |
+| `GET` | `/v1/callcenter/queues/{queue_name}/tiers/count` | Count tiers in a queue |
+| `POST` | `/v1/callcenter/queues/{queue_name}/load` | Load queue into memory |
+| `POST` | `/v1/callcenter/queues/{queue_name}/unload` | Unload queue from memory |
+| `POST` | `/v1/callcenter/queues/{queue_name}/reload` | Reload queue configuration |
+
+Queue names use `name@domain` format (e.g. `support@customer1.example.com`).
+
+### Agent Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/v1/callcenter/agents` | List all agents (filtered by contact domain) |
+| `POST` | `/v1/callcenter/agents` | Add a new agent |
+| `PUT` | `/v1/callcenter/agents/{agent_name}` | Set an agent attribute |
+| `DELETE` | `/v1/callcenter/agents/{agent_name}` | Delete an agent |
+
+Agent names are UUIDs. The `domain` field in the request body is used for authorization since the domain is stored in the agent's `contact` field (as `domain_name=<value>`), not in the agent name.
+
+**Add agent**:
+```bash
+curl -X POST http://localhost:37274/v1/callcenter/agents \
+  -H "Content-Type: application/json" \
+  -H "X-Allowed-Contexts: customer1.example.com" \
+  -d '{"name":"a1b2c3d4-e5f6-7890-1234-567890abcdef","type":"callback","domain":"customer1.example.com"}'
+```
+
+**Set agent status**:
+```bash
+curl -X PUT http://localhost:37274/v1/callcenter/agents/a1b2c3d4-e5f6-7890-1234-567890abcdef \
+  -H "Content-Type: application/json" \
+  -H "X-Allowed-Contexts: customer1.example.com" \
+  -d '{"key":"status","value":"Available","domain":"customer1.example.com"}'
+```
+
+Valid agent set keys: `status`, `state`, `contact`, `type`, `max_no_answer`, `wrap_up_time`, `reject_delay_time`, `busy_delay_time`, `ready_time`.
+
+### Tier Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/v1/callcenter/tiers` | List all tiers (filtered by queue domain) |
+| `POST` | `/v1/callcenter/tiers` | Add a new tier |
+| `PUT` | `/v1/callcenter/tiers` | Set a tier attribute |
+| `DELETE` | `/v1/callcenter/tiers` | Delete a tier |
+
+Tier operations use request bodies (not URL params) since both `queue` and `agent` are required.
+
+**Add tier**:
+```bash
+curl -X POST http://localhost:37274/v1/callcenter/tiers \
+  -H "Content-Type: application/json" \
+  -H "X-Allowed-Contexts: customer1.example.com" \
+  -d '{"queue":"support@customer1.example.com","agent":"a1b2c3d4-e5f6-7890-1234-567890abcdef","level":"1","position":"1"}'
+```
+
+**Delete tier**:
+```bash
+curl -X DELETE http://localhost:37274/v1/callcenter/tiers \
+  -H "Content-Type: application/json" \
+  -H "X-Allowed-Contexts: customer1.example.com" \
+  -d '{"queue":"support@customer1.example.com","agent":"a1b2c3d4-e5f6-7890-1234-567890abcdef"}'
+```
+
+Valid tier set keys: `state`, `level`, `position`.
+
+---
+
 ## Error Responses
 
 All endpoints return error responses in the following format:
@@ -1012,12 +1101,16 @@ All endpoints return error responses in the following format:
 ```
 /root/fs-api/
 ├── main.go           # Server initialization and routing
-├── handlers.go       # API endpoint handlers
+├── handlers.go       # Call control endpoint handlers
+├── cc_handlers.go    # Callcenter endpoint handlers (queues, agents, tiers)
+├── cc_parser.go      # Pipe-delimited output parser for mod_callcenter
+├── cc_types.go       # Callcenter request/response types
 ├── auth.go           # Context authorization logic
 ├── middleware.go     # HTTP middleware functions
-├── types.go          # Request/response structures
+├── types.go          # Call control request/response structures
 ├── esl.go            # FreeSWITCH ESL client
 ├── utils.go          # Validation and logging helpers
+├── openapi.yaml      # OpenAPI 3.0 specification
 ├── go.mod            # Go module definition
 ├── go.sum            # Go dependencies checksums
 ├── DEVELOPMENT.md    # Development guide
@@ -1081,7 +1174,7 @@ ss -tlnp | grep 37274
 
 ## Security Considerations
 
-- **Bearer Token Authentication** (NEW in v0.3.0): Configure `FSAPI_AUTH_TOKENS` to require authentication for remote requests. Generate strong, random tokens (recommended: 32+ characters). Localhost requests bypass authentication for convenience.
+- **Bearer Token Authentication** (v0.3.0+): Configure `FSAPI_AUTH_TOKENS` to require authentication for remote requests. Generate strong, random tokens (recommended: 32+ characters). Localhost requests bypass authentication for convenience.
 - **Context-Based Authorization**: Use the `X-Allowed-Contexts` header to restrict API operations by FreeSWITCH context/tenant
 - **Network Binding**: The service binds to all interfaces (0.0.0.0) by default - use a reverse proxy or firewall for external access control
 - **HTTPS/TLS**: Use a reverse proxy (nginx, Caddy) to add HTTPS encryption for production deployments
