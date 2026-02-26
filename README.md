@@ -8,9 +8,10 @@ This service provides a simple, stateless HTTP API for controlling FreeSWITCH ca
 
 ## Features
 
-- **31 API Endpoints**: 9 Call Control + 3 Query + 19 Callcenter Management
+- **33 API Endpoints**: 9 Call Control + 3 Query + 2 Registrations + 19 Callcenter Management
   - Call Control: Hangup, Transfer, Bridge, Answer, Hold/Unhold, Record, DTMF, Park, Originate
   - Query: List Calls, Call Details, FreeSWITCH Status
+  - Registrations: List and count active SIP registrations, filtered by realm/domain
   - Callcenter: Queue CRUD, Agent CRUD, Tier CRUD, Member listing, counts
 - **Bearer Token Authentication**: Secure remote access with configurable API tokens
   - Localhost requests bypass authentication for convenience
@@ -305,6 +306,8 @@ The following endpoints enforce context authorization when `X-Allowed-Contexts` 
 - ✅ `GET /v1/callcenter/queues` - List filtered by queue domain
 - ✅ `GET /v1/callcenter/agents` - List filtered by `domain_name=` in agent contact
 - ✅ `GET /v1/callcenter/tiers` - List filtered by queue domain
+- ✅ `GET /v1/registrations` - List filtered by `realm` field
+- ✅ `GET /v1/registrations/count` - Count filtered by `realm` field
 
 **Unprotected Endpoints** (system-level, no context validation):
 - `GET /v1/status` - FreeSWITCH status
@@ -988,6 +991,33 @@ curl http://localhost:37274/v1/status
 - Call rate information
 - CPU usage metrics
 - Stack size information
+
+---
+
+## Registrations API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/v1/registrations` | List active SIP registrations (filtered by realm) |
+| `GET` | `/v1/registrations/count` | Count active SIP registrations |
+
+Both endpoints require the `X-Allowed-Contexts` header. Results are filtered by the `realm` field of each registration entry, which contains the SIP domain (e.g. `customer1.example.com`).
+
+**List registrations for a specific tenant:**
+```bash
+curl http://localhost:37274/v1/registrations \
+  -H "Authorization: Bearer <token>" \
+  -H "X-Allowed-Contexts: customer1.example.com"
+```
+
+**Count registrations across multiple tenants:**
+```bash
+curl http://localhost:37274/v1/registrations/count \
+  -H "Authorization: Bearer <token>" \
+  -H "X-Allowed-Contexts: customer1.example.com,customer2.example.com"
+```
+
+Each registration row contains: `reg_user`, `realm`, `token`, `url`, `expires`, `network_ip`, `network_port`, `network_proto`, `hostname`, `metadata`.
 
 ---
 

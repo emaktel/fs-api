@@ -141,6 +141,63 @@ components:
           type: string
       required: [status, version]
 
+    RegistrationRow:
+      type: object
+      description: SIP registration entry from FreeSWITCH `show registrations`
+      properties:
+        reg_user:
+          type: string
+          description: Registered SIP username
+        realm:
+          type: string
+          description: SIP domain / realm (used for context-based filtering)
+        token:
+          type: string
+        url:
+          type: string
+          description: Full Sofia SIP contact URL
+        expires:
+          type: string
+          description: Unix timestamp when the registration expires
+        network_ip:
+          type: string
+          description: Public IP address of the endpoint
+        network_port:
+          type: string
+        network_proto:
+          type: string
+          enum: [udp, tcp, tls]
+        hostname:
+          type: string
+          description: FreeSWITCH node hostname
+        metadata:
+          type: string
+      additionalProperties: true
+
+    ListRegistrationsResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: success
+        row_count:
+          type: integer
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/RegistrationRow"
+      required: [status, row_count, rows]
+
+    CountRegistrationsResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: success
+        count:
+          type: integer
+      required: [status, count]
+
     CallRow:
       type: object
       additionalProperties:
@@ -519,6 +576,66 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StatusResponse"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  # -------------------------------------------------------------------------
+  # Registrations
+  # -------------------------------------------------------------------------
+  /v1/registrations:
+    get:
+      tags: [Registrations]
+      summary: List SIP registrations
+      description: >
+        Returns active SIP registrations. The `X-Allowed-Contexts` header is
+        **required**. When access is restricted the list is filtered to
+        registrations whose `realm` field matches an allowed context.
+      operationId: listRegistrations
+      parameters:
+        - $ref: "#/components/parameters/XAllowedContextsRequired"
+      responses:
+        "200":
+          description: Registrations retrieved
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListRegistrationsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/registrations/count:
+    get:
+      tags: [Registrations]
+      summary: Count SIP registrations
+      description: >
+        Returns the number of active SIP registrations visible to the caller.
+        The `X-Allowed-Contexts` header is **required**. Unrestricted access
+        returns the total count directly; restricted access counts only
+        registrations whose `realm` matches an allowed context.
+      operationId: countRegistrations
+      parameters:
+        - $ref: "#/components/parameters/XAllowedContextsRequired"
+      responses:
+        "200":
+          description: Registration count
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CountRegistrationsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "502":
           $ref: "#/components/responses/BadGateway"
         "503":

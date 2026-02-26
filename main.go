@@ -63,6 +63,10 @@ func main() {
 	v1.HandleFunc("/calls/{uuid}", handler.GetCallDetails).Methods("GET")
 	v1.HandleFunc("/status", handler.GetStatus).Methods("GET")
 
+	// Registration endpoints - /count must be registered before /{user} if we add that later
+	v1.HandleFunc("/registrations", handler.ListRegistrations).Methods("GET")
+	v1.HandleFunc("/registrations/count", handler.CountRegistrations).Methods("GET")
+
 	// Callcenter endpoints
 	cc := v1.PathPrefix("/callcenter").Subrouter()
 

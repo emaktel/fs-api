@@ -849,6 +849,122 @@ func (h *APIHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GET /v1/registrations
+func (h *APIHandler) ListRegistrations(w http.ResponseWriter, r *http.Request) {
+	requestID := getRequestID(r)
+
+	// X-Allowed-Contexts header is required
+	if r.Header.Get("X-Allowed-Contexts") == "" {
+		h.respondError(w, r, "X-Allowed-Contexts header is required for this endpoint", http.StatusBadRequest)
+		return
+	}
+
+	allowedContexts := getAllowedContexts(r)
+	unrestricted := isUnrestrictedAccess(r)
+
+	response, err := h.eslClient.SendCommand("api show registrations as json")
+	if err != nil {
+		statusCode := h.getErrorStatusCode(err)
+		h.respondError(w, r, fmt.Sprintf("Failed to retrieve registrations: %v", err), statusCode)
+		return
+	}
+
+	var regsData struct {
+		RowCount int                      `json:"row_count"`
+		Rows     []map[string]interface{} `json:"rows"`
+	}
+	if err := json.Unmarshal([]byte(response), &regsData); err != nil {
+		h.respondError(w, r, fmt.Sprintf("Failed to parse registrations data: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	var filtered []map[string]interface{}
+	if unrestricted {
+		filtered = regsData.Rows
+		logInfo(requestID, fmt.Sprintf("Retrieved all registrations (unrestricted): %d", len(filtered)))
+	} else {
+		for _, reg := range regsData.Rows {
+			realm, _ := reg["realm"].(string)
+			for _, allowed := range allowedContexts {
+				if realm == allowed {
+					filtered = append(filtered, reg)
+					break
+				}
+			}
+		}
+		logInfo(requestID, fmt.Sprintf("Retrieved filtered registrations for contexts %v: %d", allowedContexts, len(filtered)))
+	}
+
+	if filtered == nil {
+		filtered = []map[string]interface{}{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Request-ID", requestID)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "success",
+		"row_count": len(filtered),
+		"rows":      filtered,
+	})
+}
+
+// GET /v1/registrations/count
+func (h *APIHandler) CountRegistrations(w http.ResponseWriter, r *http.Request) {
+	requestID := getRequestID(r)
+
+	// X-Allowed-Contexts header is required
+	if r.Header.Get("X-Allowed-Contexts") == "" {
+		h.respondError(w, r, "X-Allowed-Contexts header is required for this endpoint", http.StatusBadRequest)
+		return
+	}
+
+	allowedContexts := getAllowedContexts(r)
+	unrestricted := isUnrestrictedAccess(r)
+
+	response, err := h.eslClient.SendCommand("api show registrations as json")
+	if err != nil {
+		statusCode := h.getErrorStatusCode(err)
+		h.respondError(w, r, fmt.Sprintf("Failed to retrieve registrations: %v", err), statusCode)
+		return
+	}
+
+	var regsData struct {
+		RowCount int `json:"row_count"`
+		Rows     []struct {
+			Realm string `json:"realm"`
+		} `json:"rows"`
+	}
+	if err := json.Unmarshal([]byte(response), &regsData); err != nil {
+		h.respondError(w, r, fmt.Sprintf("Failed to parse registrations data: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	count := 0
+	if unrestricted {
+		count = regsData.RowCount
+	} else {
+		for _, reg := range regsData.Rows {
+			for _, allowed := range allowedContexts {
+				if reg.Realm == allowed {
+					count++
+					break
+				}
+			}
+		}
+	}
+
+	logInfo(requestID, fmt.Sprintf("Registration count for contexts %v: %d", allowedContexts, count))
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Request-ID", requestID)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "success",
+		"count":  count,
+	})
+}
+
 // GET /health
 func (h *APIHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
