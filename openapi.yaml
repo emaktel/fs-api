@@ -21,7 +21,7 @@ info:
     For callcenter endpoints it is matched against the domain portion of
     queue/tier names (`name@domain`) or the `domain_name=` value inside agent
     contact strings.
-  version: 0.4.0
+  version: 0.4.1
   contact:
     name: Emaktel
     url: https://github.com/emaktel/fs-api

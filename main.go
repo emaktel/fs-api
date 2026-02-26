@@ -14,7 +14,7 @@ import (
 	"github.com/gorilla/mux"
 )
 
-const Version = "0.4.0"
+const Version = "0.4.1"
 
 var (
 	FSAPI_PORT        = getEnv("FSAPI_PORT", "37274")

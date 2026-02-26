@@ -331,7 +331,7 @@ curl http://localhost:37274/health
 ```json
 {
   "status": "healthy",
-  "version": "0.4.0"
+  "version": "0.4.1"
 }
 ```
 
