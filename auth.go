@@ -44,38 +44,35 @@ func getAllowedContexts(r *http.Request) []string {
 
 // getCallContext fetches call context information from FreeSWITCH
 func (h *APIHandler) getCallContext(callUUID string) (*CallContextInfo, error) {
-	// Get all calls
-	callsResponse, err := h.eslClient.SendCommand("api show calls as json")
+	// Use uuid_dump to get full channel variables for the call
+	response, err := h.eslClient.SendCommand(fmt.Sprintf("api uuid_dump %s json", callUUID))
 	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve calls: %v", err)
+		return nil, fmt.Errorf("failed to retrieve call: %v", err)
 	}
 
-	var callsData struct {
-		Rows []struct {
-			UUID        string `json:"uuid"`
-			BUUID       string `json:"b_uuid"`
-			AccountCode string `json:"accountcode"`
-		} `json:"rows"`
+	// If uuid_dump returns an error (call not found), the response won't be valid JSON
+	var dumpData map[string]interface{}
+	if err := json.Unmarshal([]byte(response), &dumpData); err != nil {
+		return &CallContextInfo{
+			UUID:  callUUID,
+			Found: false,
+		}, nil
 	}
 
-	if err := json.Unmarshal([]byte(callsResponse), &callsData); err != nil {
-		return nil, fmt.Errorf("failed to parse calls data: %v", err)
-	}
-
-	// Find call by UUID (check both A-leg and B-leg)
-	for _, row := range callsData.Rows {
-		if row.UUID == callUUID || row.BUUID == callUUID {
-			return &CallContextInfo{
-				UUID:        callUUID,
-				AccountCode: row.AccountCode,
-				Found:       true,
-			}, nil
-		}
+	// Determine context: prefer variable_accountcode, then Caller-Context, then variable_domain_name
+	callContext := ""
+	if v, ok := dumpData["variable_accountcode"].(string); ok && v != "" {
+		callContext = v
+	} else if v, ok := dumpData["Caller-Context"].(string); ok && v != "" {
+		callContext = v
+	} else if v, ok := dumpData["variable_domain_name"].(string); ok && v != "" {
+		callContext = v
 	}
 
 	return &CallContextInfo{
-		UUID:  callUUID,
-		Found: false,
+		UUID:        callUUID,
+		AccountCode: callContext,
+		Found:       true,
 	}, nil
 }
 

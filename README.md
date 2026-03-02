@@ -219,9 +219,10 @@ X-Allowed-Contexts: *
 
 When a request includes the `X-Allowed-Contexts` header:
 
-1. **Call operations** (hangup, transfer, hold, etc.): The API checks the call's `accountcode` field (which contains the FreeSWITCH context) and verifies it matches one of the allowed contexts
-2. **Originate operations**: The API validates the requested `context` parameter against allowed contexts
-3. **Bridge operations**: Both call UUIDs are validated against allowed contexts
+1. **Call operations** (hangup, transfer, hold, etc.): The API resolves the call's context using `uuid_dump` (checking `variable_accountcode`, `Caller-Context`, and `variable_domain_name` in order) and verifies it matches one of the allowed contexts
+2. **Call listing**: The API cross-references `show calls` with `show channels` to resolve call context when `accountcode` is not set
+3. **Originate operations**: The API validates the requested `context` parameter against allowed contexts
+4. **Bridge operations**: Both call UUIDs are validated against allowed contexts
 
 #### Examples
 
@@ -331,7 +332,7 @@ curl http://localhost:37274/health
 ```json
 {
   "status": "healthy",
-  "version": "0.4.1"
+  "version": "0.4.2"
 }
 ```
 

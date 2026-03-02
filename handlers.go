@@ -598,8 +598,7 @@ func (h *APIHandler) ListCalls(w http.ResponseWriter, r *http.Request) {
 	unrestricted := isUnrestrictedAccess(r)
 
 	// Step 1: Get all calls from FreeSWITCH
-	showCallsCmd := "api show calls as json"
-	callsResponse, err := h.eslClient.SendCommand(showCallsCmd)
+	callsResponse, err := h.eslClient.SendCommand("api show calls as json")
 	if err != nil {
 		statusCode := h.getErrorStatusCode(err)
 		h.respondError(w, r, fmt.Sprintf("Failed to retrieve calls: %v", err), statusCode)
@@ -625,18 +624,39 @@ func (h *APIHandler) ListCalls(w http.ResponseWriter, r *http.Request) {
 		filteredCalls = callsData.Rows
 		logInfo(requestID, fmt.Sprintf("Retrieved all calls (unrestricted access): %d calls", len(filteredCalls)))
 	} else {
+		// Build a context lookup from channels for calls with empty accountcode
+		contextMap := map[string]string{}
+		channelsResponse, err := h.eslClient.SendCommand("api show channels as json")
+		if err == nil {
+			var channelsData struct {
+				Rows []struct {
+					UUID    string `json:"uuid"`
+					Context string `json:"context"`
+				} `json:"rows"`
+			}
+			if json.Unmarshal([]byte(channelsResponse), &channelsData) == nil {
+				for _, ch := range channelsData.Rows {
+					contextMap[ch.UUID] = ch.Context
+				}
+			}
+		}
+
 		// Filter by allowed contexts
 		for _, call := range callsData.Rows {
-			// Get accountcode from the call
-			accountcode, ok := call["accountcode"].(string)
-			if !ok {
-				// If accountcode is missing, skip this call
+			// Prefer accountcode, fall back to channel context
+			callContext, _ := call["accountcode"].(string)
+			if callContext == "" {
+				if uuid, _ := call["uuid"].(string); uuid != "" {
+					callContext = contextMap[uuid]
+				}
+			}
+			if callContext == "" {
 				continue
 			}
 
 			// Check if this call's context is in the allowed list
 			for _, allowed := range allowedContexts {
-				if accountcode == allowed {
+				if callContext == allowed {
 					filteredCalls = append(filteredCalls, call)
 					break
 				}
