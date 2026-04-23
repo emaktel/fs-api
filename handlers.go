@@ -4,10 +4,68 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/gorilla/mux"
 )
+
+// Channel fields that should be copied from a `show channels as json` row onto
+// the corresponding call row from `show calls as json`. `show calls` returns a
+// condensed per-call view and is missing all of these, so we enrich here.
+var channelEnrichFields = []string{
+	"context",
+	"application",
+	"application_data",
+	"read_codec",
+	"read_rate",
+	"write_codec",
+	"write_rate",
+	"secure",
+	"effective_caller_id_name",
+}
+
+// faxPathRegex extracts the tenant folder from a fax storage path like
+// `/var/lib/freeswitch/storage/fax/<tenant>/...`.
+var faxPathRegex = regexp.MustCompile(`/fax/([^/]+)/`)
+
+// resolveDomainName mirrors the PHP logic in calls_active_inc.php:
+//  1. Fax calls  → extract from application_data
+//  2. Non-public, non-default context → use context (split on @ if present)
+//  3. presence_id → domain after @
+//  4. Fallback
+func resolveDomainName(application, applicationData, context, presenceID, fallback string) string {
+	if (strings.HasPrefix(application, "txfax") || strings.HasPrefix(application, "rxfax")) && applicationData != "" {
+		if m := faxPathRegex.FindStringSubmatch(applicationData); len(m) > 1 {
+			return m[1]
+		}
+	}
+	if context != "" && context != "public" && context != "default" {
+		if idx := strings.Index(context, "@"); idx >= 0 && idx+1 < len(context) {
+			return context[idx+1:]
+		}
+		return context
+	}
+	if idx := strings.Index(presenceID, "@"); idx >= 0 && idx+1 < len(presenceID) {
+		return presenceID[idx+1:]
+	}
+	return fallback
+}
+
+// stringField extracts a string value from a generic map[string]interface{}
+// (FreeSWITCH JSON bodies stringify everything, but be defensive).
+func stringField(m map[string]interface{}, key string) string {
+	if m == nil {
+		return ""
+	}
+	if v, ok := m[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
 
 // Context keys
 type contextKey string
@@ -583,6 +641,13 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /v1/calls
+//
+// Runs `show calls as json` (per-call summary with b_* fields) and
+// `show channels as json` (per-channel variables) in parallel, then merges
+// the richer channel variables (context, application, codec, …) onto the
+// corresponding call row. The frontend's Active Calls page relies on these
+// fields to display the correct tenant domain, Application, and Codec —
+// matching the legacy PHP implementation which used `show channels` directly.
 func (h *APIHandler) ListCalls(w http.ResponseWriter, r *http.Request) {
 	requestID := getRequestID(r)
 
@@ -593,79 +658,156 @@ func (h *APIHandler) ListCalls(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get allowed contexts from the middleware
 	allowedContexts := getAllowedContexts(r)
 	unrestricted := isUnrestrictedAccess(r)
 
-	// Step 1: Get all calls from FreeSWITCH
-	callsResponse, err := h.eslClient.SendCommand("api show calls as json")
-	if err != nil {
-		statusCode := h.getErrorStatusCode(err)
-		h.respondError(w, r, fmt.Sprintf("Failed to retrieve calls: %v", err), statusCode)
+	// Step 1: Fetch calls + channels concurrently. The two ESL commands are
+	// independent, so parallelising halves the round-trip budget.
+	var (
+		callsResponse    string
+		channelsResponse string
+		callsErr         error
+		channelsErr      error
+		wg               sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		callsResponse, callsErr = h.eslClient.SendCommand("api show calls as json")
+	}()
+	go func() {
+		defer wg.Done()
+		channelsResponse, channelsErr = h.eslClient.SendCommand("api show channels as json")
+	}()
+	wg.Wait()
+
+	if callsErr != nil {
+		statusCode := h.getErrorStatusCode(callsErr)
+		h.respondError(w, r, fmt.Sprintf("Failed to retrieve calls: %v", callsErr), statusCode)
 		return
 	}
 
-	// Step 2: Parse JSON response
+	// Step 2: Parse calls payload
 	var callsData struct {
 		RowCount int                      `json:"row_count"`
 		Rows     []map[string]interface{} `json:"rows"`
 	}
-
 	if err := json.Unmarshal([]byte(callsResponse), &callsData); err != nil {
 		h.respondError(w, r, fmt.Sprintf("Failed to parse calls data: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Step 3: Filter calls based on allowed contexts
-	var filteredCalls []map[string]interface{}
-
-	if unrestricted {
-		// Wildcard or no restrictions - return all calls
-		filteredCalls = callsData.Rows
-		logInfo(requestID, fmt.Sprintf("Retrieved all calls (unrestricted access): %d calls", len(filteredCalls)))
-	} else {
-		// Build a context lookup from channels for calls with empty accountcode
-		contextMap := map[string]string{}
-		channelsResponse, err := h.eslClient.SendCommand("api show channels as json")
-		if err == nil {
-			var channelsData struct {
-				Rows []struct {
-					UUID    string `json:"uuid"`
-					Context string `json:"context"`
-				} `json:"rows"`
+	// Step 3: Parse channels payload (best-effort — if this fails we still
+	// return the call rows without the extra fields).
+	channelByUUID := map[string]map[string]interface{}{}
+	if channelsErr == nil {
+		var channelsData struct {
+			RowCount int                      `json:"row_count"`
+			Rows     []map[string]interface{} `json:"rows"`
+		}
+		if err := json.Unmarshal([]byte(channelsResponse), &channelsData); err == nil {
+			for _, ch := range channelsData.Rows {
+				if uuid := stringField(ch, "uuid"); uuid != "" {
+					channelByUUID[uuid] = ch
+				}
 			}
-			if json.Unmarshal([]byte(channelsResponse), &channelsData) == nil {
-				for _, ch := range channelsData.Rows {
-					contextMap[ch.UUID] = ch.Context
+		} else {
+			logWarn(requestID, fmt.Sprintf("Failed to parse channels data (continuing without enrichment): %v", err))
+		}
+	} else {
+		logWarn(requestID, fmt.Sprintf("show channels failed (continuing without enrichment): %v", channelsErr))
+	}
+
+	// Step 4: Enrich each call row with A-leg + B-leg channel variables and a
+	// derived `domain_name` (PHP-compatible).
+	for _, call := range callsData.Rows {
+		aUUID := stringField(call, "uuid")
+		bUUID := stringField(call, "b_uuid")
+
+		// A-leg enrichment — write fields directly (no prefix).
+		if aCh, ok := channelByUUID[aUUID]; ok {
+			for _, field := range channelEnrichFields {
+				if v := stringField(aCh, field); v != "" {
+					call[field] = v
+				}
+			}
+		}
+		// B-leg enrichment — prefix with b_.
+		if bUUID != "" {
+			if bCh, ok := channelByUUID[bUUID]; ok {
+				for _, field := range channelEnrichFields {
+					if v := stringField(bCh, field); v != "" {
+						call["b_"+field] = v
+					}
 				}
 			}
 		}
 
-		// Filter by allowed contexts
-		for _, call := range callsData.Rows {
-			// Prefer accountcode, fall back to channel context
-			callContext, _ := call["accountcode"].(string)
-			if callContext == "" {
-				if uuid, _ := call["uuid"].(string); uuid != "" {
-					callContext = contextMap[uuid]
-				}
-			}
-			if callContext == "" {
-				continue
-			}
+		// Derived domain for each leg. Used for response + filtering.
+		aDomain := resolveDomainName(
+			stringField(call, "application"),
+			stringField(call, "application_data"),
+			stringField(call, "context"),
+			stringField(call, "presence_id"),
+			"",
+		)
+		bDomain := ""
+		if bUUID != "" {
+			bDomain = resolveDomainName(
+				stringField(call, "b_application"),
+				stringField(call, "b_application_data"),
+				stringField(call, "b_context"),
+				stringField(call, "b_presence_id"),
+				"",
+			)
+		}
+		// Prefer whichever leg actually carries the tenant domain (bridged
+		// carrier-inbound calls: A-leg context is often `public` or the
+		// carrier IP, B-leg context is the tenant domain).
+		effectiveDomain := bDomain
+		if effectiveDomain == "" {
+			effectiveDomain = aDomain
+		}
+		if effectiveDomain != "" {
+			call["domain_name"] = effectiveDomain
+		}
+		if aDomain != "" {
+			call["a_domain_name"] = aDomain
+		}
+		if bDomain != "" {
+			call["b_domain_name"] = bDomain
+		}
+	}
 
-			// Check if this call's context is in the allowed list
-			for _, allowed := range allowedContexts {
-				if callContext == allowed {
-					filteredCalls = append(filteredCalls, call)
-					break
-				}
+	// Step 5: Filter by allowed contexts. PHP filtered by derived domain, and
+	// the accountcode-only filter used previously would silently drop carrier
+	// calls whose accountcode is empty. We now match on accountcode OR derived
+	// domain from either leg — any match keeps the row.
+	var filteredCalls []map[string]interface{}
+	if unrestricted {
+		filteredCalls = callsData.Rows
+		logInfo(requestID, fmt.Sprintf("Retrieved all calls (unrestricted access): %d calls", len(filteredCalls)))
+	} else {
+		allowedSet := make(map[string]struct{}, len(allowedContexts))
+		for _, a := range allowedContexts {
+			allowedSet[a] = struct{}{}
+		}
+		for _, call := range callsData.Rows {
+			accountcode := stringField(call, "accountcode")
+			aDomain := stringField(call, "a_domain_name")
+			bDomain := stringField(call, "b_domain_name")
+
+			_, hitAcct := allowedSet[accountcode]
+			_, hitA := allowedSet[aDomain]
+			_, hitB := allowedSet[bDomain]
+			if hitAcct || hitA || hitB {
+				filteredCalls = append(filteredCalls, call)
 			}
 		}
 		logInfo(requestID, fmt.Sprintf("Retrieved filtered calls for contexts %v: %d calls", allowedContexts, len(filteredCalls)))
 	}
 
-	// Step 4: Return the filtered calls
+	// Step 6: Return
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Request-ID", requestID)
 	w.WriteHeader(http.StatusOK)
