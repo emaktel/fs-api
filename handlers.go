@@ -582,6 +582,33 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// channelOnlyFields are fields returned by `show channels` that are not present
+// in `show calls`. Used to enrich /v1/calls responses without overwriting any
+// key that `show calls` already provides.
+var channelOnlyFields = []string{
+	"application", "application_data",
+	"dialplan", "context",
+	"read_codec", "read_rate", "read_bit_rate",
+	"write_codec", "write_rate", "write_bit_rate",
+	"secure",
+	"initial_cid_name", "initial_cid_num", "initial_ip_addr",
+	"initial_dest", "initial_dialplan", "initial_context",
+}
+
+// enrichCallWithChannel copies channel-only fields from ch into call. When bLeg
+// is true, field names are prefixed with "b_" to match the show-calls convention.
+func enrichCallWithChannel(call, ch map[string]interface{}, bLeg bool) {
+	prefix := ""
+	if bLeg {
+		prefix = "b_"
+	}
+	for _, f := range channelOnlyFields {
+		if v, ok := ch[f]; ok {
+			call[prefix+f] = v
+		}
+	}
+}
+
 // GET /v1/calls
 func (h *APIHandler) ListCalls(w http.ResponseWriter, r *http.Request) {
 	requestID := getRequestID(r)
@@ -616,7 +643,27 @@ func (h *APIHandler) ListCalls(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 3: Filter calls based on allowed contexts
+	// Step 3: Fetch channels for context fallback (restricted path) and field
+	// enrichment. Non-fatal on error: calls are still returned, just without
+	// channel-only fields merged in.
+	channelsByUUID := map[string]map[string]interface{}{}
+	if len(callsData.Rows) > 0 {
+		channelsResponse, chErr := h.eslClient.SendCommand("api show channels as json")
+		if chErr == nil {
+			var channelsData struct {
+				Rows []map[string]interface{} `json:"rows"`
+			}
+			if json.Unmarshal([]byte(channelsResponse), &channelsData) == nil {
+				for _, ch := range channelsData.Rows {
+					if uuid, _ := ch["uuid"].(string); uuid != "" {
+						channelsByUUID[uuid] = ch
+					}
+				}
+			}
+		}
+	}
+
+	// Step 4: Filter calls based on allowed contexts
 	var filteredCalls []map[string]interface{}
 
 	if unrestricted {
@@ -624,30 +671,14 @@ func (h *APIHandler) ListCalls(w http.ResponseWriter, r *http.Request) {
 		filteredCalls = callsData.Rows
 		logInfo(requestID, fmt.Sprintf("Retrieved all calls (unrestricted access): %d calls", len(filteredCalls)))
 	} else {
-		// Build a context lookup from channels for calls with empty accountcode
-		contextMap := map[string]string{}
-		channelsResponse, err := h.eslClient.SendCommand("api show channels as json")
-		if err == nil {
-			var channelsData struct {
-				Rows []struct {
-					UUID    string `json:"uuid"`
-					Context string `json:"context"`
-				} `json:"rows"`
-			}
-			if json.Unmarshal([]byte(channelsResponse), &channelsData) == nil {
-				for _, ch := range channelsData.Rows {
-					contextMap[ch.UUID] = ch.Context
-				}
-			}
-		}
-
-		// Filter by allowed contexts
 		for _, call := range callsData.Rows {
 			// Prefer accountcode, fall back to channel context
 			callContext, _ := call["accountcode"].(string)
 			if callContext == "" {
 				if uuid, _ := call["uuid"].(string); uuid != "" {
-					callContext = contextMap[uuid]
+					if ch, ok := channelsByUUID[uuid]; ok {
+						callContext, _ = ch["context"].(string)
+					}
 				}
 			}
 			if callContext == "" {
@@ -665,7 +696,23 @@ func (h *APIHandler) ListCalls(w http.ResponseWriter, r *http.Request) {
 		logInfo(requestID, fmt.Sprintf("Retrieved filtered calls for contexts %v: %d calls", allowedContexts, len(filteredCalls)))
 	}
 
-	// Step 4: Return the filtered calls
+	// Step 5: Enrich each surviving call with channel-only fields for the A-leg
+	// (uuid) and, when present, the B-leg (b_uuid). Missing channels are
+	// tolerated — enrichment is skipped for that leg.
+	for _, call := range filteredCalls {
+		if uuid, _ := call["uuid"].(string); uuid != "" {
+			if ch, ok := channelsByUUID[uuid]; ok {
+				enrichCallWithChannel(call, ch, false)
+			}
+		}
+		if bUUID, _ := call["b_uuid"].(string); bUUID != "" {
+			if ch, ok := channelsByUUID[bUUID]; ok {
+				enrichCallWithChannel(call, ch, true)
+			}
+		}
+	}
+
+	// Step 6: Return the filtered calls
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Request-ID", requestID)
 	w.WriteHeader(http.StatusOK)
@@ -791,6 +838,31 @@ func (h *APIHandler) GetCallDetails(w http.ResponseWriter, r *http.Request) {
 	if len(callInfoWrapper.Rows) == 0 {
 		h.respondError(w, r, "Call data not found in response", http.StatusInternalServerError)
 		return
+	}
+
+	// Enrich call_info with channel-only fields so it matches the /v1/calls
+	// list response shape. Non-fatal on error: the rest of the response still
+	// includes full A-leg/B-leg uuid_dump data.
+	if channelsResponse, chErr := h.eslClient.SendCommand("api show channels as json"); chErr == nil {
+		var channelsData struct {
+			Rows []map[string]interface{} `json:"rows"`
+		}
+		if json.Unmarshal([]byte(channelsResponse), &channelsData) == nil {
+			channelsByUUID := map[string]map[string]interface{}{}
+			for _, ch := range channelsData.Rows {
+				if uuid, _ := ch["uuid"].(string); uuid != "" {
+					channelsByUUID[uuid] = ch
+				}
+			}
+			if ch, ok := channelsByUUID[aLegUUID]; ok {
+				enrichCallWithChannel(callInfoWrapper.Rows[0], ch, false)
+			}
+			if bLegUUID != "" {
+				if ch, ok := channelsByUUID[bLegUUID]; ok {
+					enrichCallWithChannel(callInfoWrapper.Rows[0], ch, true)
+				}
+			}
+		}
 	}
 
 	logInfo(requestID, fmt.Sprintf("Call details retrieved for %s", callUUID))

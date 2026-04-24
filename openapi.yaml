@@ -202,7 +202,18 @@ components:
       type: object
       additionalProperties:
         type: string
-      description: Call summary row from FreeSWITCH `show calls`
+      description: >
+        Call summary row from FreeSWITCH `show calls`, enriched with fields
+        that only appear in `show channels`. A-leg channel fields are merged
+        as-is; B-leg channel fields are prefixed with `b_` to match the
+        existing `show calls` convention. Enriched fields: `application`,
+        `application_data`, `dialplan`, `context`, `read_codec`, `read_rate`,
+        `read_bit_rate`, `write_codec`, `write_rate`, `write_bit_rate`,
+        `secure`, `initial_cid_name`, `initial_cid_num`, `initial_ip_addr`,
+        `initial_dest`, `initial_dialplan`, `initial_context` (and their
+        `b_`-prefixed B-leg counterparts when a B-leg exists). Fields are
+        omitted for legs whose channel row is not currently in the channels
+        table.
 
     ListCallsResponse:
       type: object
@@ -227,6 +238,10 @@ components:
         call_info:
           type: object
           additionalProperties: true
+          description: >
+            Same enriched shape as `CallRow`: a `show calls` row merged with
+            channel-only fields from `show channels` (A-leg as-is, B-leg
+            fields prefixed with `b_`).
         aleg:
           type: object
           properties:
