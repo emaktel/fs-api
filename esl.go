@@ -89,7 +89,7 @@ func (esl *ESLgoClient) SendCommand(cmd string) (string, error) {
 	}
 
 	// Create context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	// Send the command and get response

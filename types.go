@@ -50,4 +50,5 @@ type OriginateRequest struct {
 	CallerIDNumber   string                 `json:"caller_id_number,omitempty"`
 	TimeoutSec       int                    `json:"timeout_sec,omitempty"`
 	ChannelVariables map[string]interface{} `json:"channel_variables,omitempty"`
+	CallbackURL      string                 `json:"callback_url,omitempty"`
 }

@@ -22,15 +22,25 @@ var (
 	ESL_PORT          = getEnv("ESL_PORT", "8021")
 	ESL_PASSWORD      = getEnv("ESL_PASSWORD", "ClueCon")
 	FSAPI_AUTH_TOKENS = getEnv("FSAPI_AUTH_TOKENS", "")
+	BROADCAST_URL     = getEnv("BROADCAST_URL", "")
+	BROADCAST_SECRET  = getEnv("BROADCAST_SECRET", "")
 )
 
 func main() {
 	handler := NewAPIHandler(ESL_HOST, ESL_PORT, ESL_PASSWORD)
 
+	// Start event subscriber for real-time call events
+	eventSub := NewEventSubscriber(ESL_HOST, ESL_PORT, ESL_PASSWORD, BROADCAST_URL, BROADCAST_SECRET)
+	handler.eventSubscriber = eventSub
+
 	// Parse authentication tokens
 	var authTokens []string
 	if FSAPI_AUTH_TOKENS != "" {
+	BROADCAST_URL     = getEnv("BROADCAST_URL", "")
+	BROADCAST_SECRET  = getEnv("BROADCAST_SECRET", "")
 		tokens := strings.Split(FSAPI_AUTH_TOKENS, ",")
+	BROADCAST_URL     = getEnv("BROADCAST_URL", "")
+	BROADCAST_SECRET  = getEnv("BROADCAST_SECRET", "")
 		for _, token := range tokens {
 			trimmed := strings.TrimSpace(token)
 			if trimmed != "" {
@@ -116,11 +126,29 @@ func main() {
 		Addr:         addr,
 		Handler:      r,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
+		WriteTimeout: 120 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
 	log.Printf("Server configured with ReadTimeout: 15s, WriteTimeout: 15s, IdleTimeout: 60s")
+
+	// Start event subscriber in background
+	eventsCtx, eventsCancel := context.WithCancel(context.Background())
+	go eventSub.Start(eventsCtx)
+
+	// Periodic cleanup of stale call registrations (calls that never got CHANNEL_DESTROY)
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-eventsCtx.Done():
+				return
+			case <-ticker.C:
+				eventSub.cleanupStaleRegistrations(1 * time.Hour)
+			}
+		}
+	}()
 
 	// Start server in a goroutine
 	go func() {
@@ -137,6 +165,7 @@ func main() {
 	<-quit
 
 	log.Println("Shutting down server...")
+	eventsCancel()
 
 	// Create shutdown context with 30 second timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

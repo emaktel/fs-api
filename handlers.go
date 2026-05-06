@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gorilla/mux"
 )
@@ -24,6 +25,7 @@ func getRequestID(r *http.Request) string {
 // API Handlers
 type APIHandler struct {
 	eslClient ESLClient
+	eventSubscriber *EventSubscriber
 }
 
 func NewAPIHandler(eslHost, eslPort, eslPassword string) *APIHandler {
@@ -569,6 +571,33 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 	}
 
 	logInfo(requestID, "Call originated successfully")
+
+	// Parse call UUID from response (format: "+OK <uuid>")
+	response = strings.TrimSpace(response)
+	if strings.HasPrefix(response, "+OK ") {
+		response = strings.TrimPrefix(response, "+OK ")
+		response = strings.TrimPrefix(response, "Job-UUID: ")
+	}
+	parsedCallUUID := strings.TrimSpace(response)
+
+	// Register call for event tracking
+	if h.eventSubscriber != nil && parsedCallUUID != "" {
+		userUUID := r.Header.Get("X-User-UUID")
+		domainUUID := r.Header.Get("X-Domain-UUID")
+		allowedContexts := getAllowedContexts(r)
+		domainName := ""
+		if len(allowedContexts) > 0 {
+			domainName = allowedContexts[0]
+		}
+		h.eventSubscriber.RegisterCall(&CallRegistration{
+			CallUUID:    parsedCallUUID,
+			UserUUID:    userUUID,
+			DomainUUID:  domainUUID,
+			DomainName:  domainName,
+			CallbackURL: req.CallbackURL,
+			CreatedAt:   time.Now(),
+		})
+	}
 
 	// Return the response (usually contains job UUID or call UUID)
 	w.Header().Set("Content-Type", "application/json")
