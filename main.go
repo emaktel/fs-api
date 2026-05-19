@@ -14,33 +14,38 @@ import (
 	"github.com/gorilla/mux"
 )
 
-const Version = "0.4.2"
+const Version = "0.5.0"
 
 var (
-	FSAPI_PORT        = getEnv("FSAPI_PORT", "37274")
-	ESL_HOST          = getEnv("ESL_HOST", "localhost")
-	ESL_PORT          = getEnv("ESL_PORT", "8021")
-	ESL_PASSWORD      = getEnv("ESL_PASSWORD", "ClueCon")
-	FSAPI_AUTH_TOKENS = getEnv("FSAPI_AUTH_TOKENS", "")
-	BROADCAST_URL     = getEnv("BROADCAST_URL", "")
-	BROADCAST_SECRET  = getEnv("BROADCAST_SECRET", "")
+	FSAPI_PORT             = getEnv("FSAPI_PORT", "37274")
+	ESL_HOST               = getEnv("ESL_HOST", "localhost")
+	ESL_PORT               = getEnv("ESL_PORT", "8021")
+	ESL_PASSWORD           = getEnv("ESL_PASSWORD", "ClueCon")
+	FSAPI_AUTH_TOKENS      = getEnv("FSAPI_AUTH_TOKENS", "")
+	BROADCAST_URL          = getEnv("BROADCAST_URL", "")
+	BROADCAST_SECRET       = getEnv("BROADCAST_SECRET", "")
+	INBOUND_WEBHOOK        = getEnv("INBOUND_WEBHOOK", "")
+	INBOUND_TOPIC_PREFIX   = getEnv("INBOUND_TOPIC_PREFIX", "")
 )
 
 func main() {
 	handler := NewAPIHandler(ESL_HOST, ESL_PORT, ESL_PASSWORD)
 
-	// Start event subscriber for real-time call events
-	eventSub := NewEventSubscriber(ESL_HOST, ESL_PORT, ESL_PASSWORD, BROADCAST_URL, BROADCAST_SECRET)
+	eventSub := NewEventSubscriber(EventSubscriberConfig{
+		ESLHost:            ESL_HOST,
+		ESLPort:            ESL_PORT,
+		ESLPassword:        ESL_PASSWORD,
+		BroadcastURL:       BROADCAST_URL,
+		BroadcastSecret:    BROADCAST_SECRET,
+		InboundWebhookURL:  INBOUND_WEBHOOK,
+		InboundTopicPrefix: INBOUND_TOPIC_PREFIX,
+	})
 	handler.eventSubscriber = eventSub
 
 	// Parse authentication tokens
 	var authTokens []string
 	if FSAPI_AUTH_TOKENS != "" {
-	BROADCAST_URL     = getEnv("BROADCAST_URL", "")
-	BROADCAST_SECRET  = getEnv("BROADCAST_SECRET", "")
 		tokens := strings.Split(FSAPI_AUTH_TOKENS, ",")
-	BROADCAST_URL     = getEnv("BROADCAST_URL", "")
-	BROADCAST_SECRET  = getEnv("BROADCAST_SECRET", "")
 		for _, token := range tokens {
 			trimmed := strings.TrimSpace(token)
 			if trimmed != "" {
@@ -73,14 +78,13 @@ func main() {
 	v1.HandleFunc("/calls/{uuid}", handler.GetCallDetails).Methods("GET")
 	v1.HandleFunc("/status", handler.GetStatus).Methods("GET")
 
-	// Registration endpoints - /count must be registered before /{user} if we add that later
+	// Registration endpoints
 	v1.HandleFunc("/registrations", handler.ListRegistrations).Methods("GET")
 	v1.HandleFunc("/registrations/count", handler.CountRegistrations).Methods("GET")
 
 	// Callcenter endpoints
 	cc := v1.PathPrefix("/callcenter").Subrouter()
 
-	// Queue endpoints - register /queues/count before /{queue_name} to avoid mux conflicts
 	cc.HandleFunc("/queues", handler.CCListQueues).Methods("GET")
 	cc.HandleFunc("/queues/count", handler.CCCountQueues).Methods("GET")
 	cc.HandleFunc("/queues/{queue_name}/agents", handler.CCListQueueAgents).Methods("GET")
@@ -93,13 +97,11 @@ func main() {
 	cc.HandleFunc("/queues/{queue_name}/unload", handler.CCUnloadQueue).Methods("POST")
 	cc.HandleFunc("/queues/{queue_name}/reload", handler.CCReloadQueue).Methods("POST")
 
-	// Agent endpoints
 	cc.HandleFunc("/agents", handler.CCListAgents).Methods("GET")
 	cc.HandleFunc("/agents", handler.CCAddAgent).Methods("POST")
 	cc.HandleFunc("/agents/{agent_name}", handler.CCDeleteAgent).Methods("DELETE")
 	cc.HandleFunc("/agents/{agent_name}", handler.CCSetAgent).Methods("PUT")
 
-	// Tier endpoints
 	cc.HandleFunc("/tiers", handler.CCListTiers).Methods("GET")
 	cc.HandleFunc("/tiers", handler.CCAddTier).Methods("POST")
 	cc.HandleFunc("/tiers", handler.CCDeleteTier).Methods("DELETE")
@@ -108,12 +110,10 @@ func main() {
 	// Health check endpoint
 	r.HandleFunc("/health", handler.HealthCheck).Methods("GET")
 
-	// Bind to all interfaces (0.0.0.0) instead of just localhost
 	addr := fmt.Sprintf(":%s", FSAPI_PORT)
 	log.Printf("FreeSWITCH Call Control API v%s starting on %s (all interfaces)", Version, addr)
 	log.Printf("ESL configured for %s:%s", ESL_HOST, ESL_PORT)
 
-	// Log authentication status
 	if len(authTokens) > 0 {
 		log.Printf("Bearer token authentication: ENABLED (%d token(s) configured)", len(authTokens))
 	} else {
@@ -121,7 +121,16 @@ func main() {
 		log.Printf("WARNING: API is accessible without authentication")
 	}
 
-	// Configure HTTP server with timeouts
+	if BROADCAST_URL != "" {
+		log.Printf("Event broadcast URL: %s", BROADCAST_URL)
+	}
+	if INBOUND_TOPIC_PREFIX != "" {
+		log.Printf("Inbound call topic prefix: %q (broadcasts to %s{e164_number})", INBOUND_TOPIC_PREFIX, INBOUND_TOPIC_PREFIX)
+	}
+	if INBOUND_WEBHOOK != "" {
+		log.Printf("Inbound call webhook: %s", INBOUND_WEBHOOK)
+	}
+
 	srv := &http.Server{
 		Addr:         addr,
 		Handler:      r,
@@ -136,7 +145,7 @@ func main() {
 	eventsCtx, eventsCancel := context.WithCancel(context.Background())
 	go eventSub.Start(eventsCtx)
 
-	// Periodic cleanup of stale call registrations (calls that never got CHANNEL_DESTROY)
+	// Periodic cleanup of stale call registrations
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
@@ -150,7 +159,6 @@ func main() {
 		}
 	}()
 
-	// Start server in a goroutine
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server error: %v", err)
@@ -159,7 +167,6 @@ func main() {
 
 	log.Println("Server started successfully")
 
-	// Wait for interrupt signal to gracefully shutdown the server
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
@@ -167,18 +174,15 @@ func main() {
 	log.Println("Shutting down server...")
 	eventsCancel()
 
-	// Create shutdown context with 30 second timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Attempt graceful shutdown
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Printf("Server forced to shutdown: %v", err)
 	} else {
 		log.Println("Server shutdown gracefully")
 	}
 
-	// Close ESL connection
 	if err := handler.eslClient.Close(); err != nil {
 		log.Printf("Error closing ESL client: %v", err)
 	}
