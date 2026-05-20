@@ -43,6 +43,7 @@ type CallEvent struct {
 // BroadcastPayload matches the websocket worker /broadcast format.
 type BroadcastPayload struct {
 	UserUUID   string      `json:"userUuid,omitempty"`
+	UserUUIDs  []string    `json:"userUuids,omitempty"`
 	DomainUUID string      `json:"domainUuid,omitempty"`
 	Topic      string      `json:"topic,omitempty"`
 	Type       string      `json:"type"`
@@ -79,19 +80,32 @@ type RingCallData struct {
 	Timestamp         int64  `json:"timestamp"`
 }
 
-// ringRegistration tracks a b-leg so answer/hangup events can be forwarded to the user.
+// ringRegistration tracks a b-leg so answer/hangup events can be forwarded to the users.
 type ringRegistration struct {
-	userUuid   string
+	userUuids  []string
 	domainUuid string
 	callerID   string
 	extension  string
 	createdAt  time.Time
 }
 
-// userCacheEntry holds a resolved extension → user mapping with TTL.
-type userCacheEntry struct {
+func userUuidsFromResolved(users []resolvedUser) []string {
+	uuids := make([]string, len(users))
+	for i, u := range users {
+		uuids[i] = u.userUuid
+	}
+	return uuids
+}
+
+// resolvedUser holds a single user resolved from an extension.
+type resolvedUser struct {
 	userUuid   string
 	domainUuid string
+}
+
+// userCacheEntry holds resolved extension → users mapping with TTL.
+type userCacheEntry struct {
+	users      []resolvedUser
 	resolvedAt time.Time
 }
 
@@ -545,26 +559,26 @@ func (es *EventSubscriber) handleExtensionRing(event *eslgo.Event, callUUID, dom
 	log.Printf("[Events] Extension ring: %s → %s@%s (call %s, a-leg %s)", callerIDNumber, extension, domainName, callUUID, alegUUID)
 
 	resolved := es.resolveUser(extension, domainName)
-	if resolved == nil {
+	if resolved == nil || len(resolved.users) == 0 {
 		return
 	}
 
-	// Register this b-leg so we can forward answer/hangup events to the same user
+	// Register this b-leg for all resolved users so answer/hangup events forward to them
 	es.ringMu.Lock()
 	es.ringRegistry[callUUID] = &ringRegistration{
-		userUuid:   resolved.userUuid,
-		domainUuid: resolved.domainUuid,
+		userUuids:  userUuidsFromResolved(resolved.users),
+		domainUuid: resolved.users[0].domainUuid,
 		callerID:   callerIDNumber,
 		extension:  extension,
 		createdAt:  time.Now(),
 	}
 	es.ringMu.Unlock()
 
-	// Deduplicate: only one ring broadcast per user per inbound call.
+	// Deduplicate: only one ring broadcast per set of users per inbound call.
 	// FreeSWITCH creates multiple b-legs for ring groups, retries, and
 	// simultaneous ring — each user should see at most one call pop.
 	if alegUUID != "" {
-		ringKey := alegUUID + ":" + resolved.userUuid
+		ringKey := alegUUID + ":" + extension + "@" + domainName
 		es.seenRingMu.Lock()
 		if _, seen := es.seenRing[ringKey]; seen {
 			es.seenRingMu.Unlock()
@@ -584,7 +598,7 @@ func (es *EventSubscriber) handleExtensionRing(event *eslgo.Event, callUUID, dom
 		Timestamp:         time.Now().Unix(),
 	}
 
-	go es.broadcastRing(resolved.userUuid, data)
+	go es.broadcastRing(userUuidsFromResolved(resolved.users), data)
 }
 
 // handleRingLifecycle forwards answer/hangup events for tracked b-legs so the
@@ -612,8 +626,8 @@ func (es *EventSubscriber) handleRingLifecycle(callUUID, eventName string, event
 		hangupCause = eslDecode(event.Headers.Get("Hangup-Cause"))
 	}
 
-	log.Printf("[Events] Call state %s for %s@%s → user %s (cause: %s)",
-		state, reg.extension, reg.callerID, reg.userUuid, hangupCause)
+	log.Printf("[Events] Call state %s for %s@%s → %d users (cause: %s)",
+		state, reg.extension, reg.callerID, len(reg.userUuids), hangupCause)
 
 	data := CallStateData{
 		CallUUID:    callUUID,
@@ -623,16 +637,15 @@ func (es *EventSubscriber) handleRingLifecycle(callUUID, eventName string, event
 		Timestamp:   time.Now().Unix(),
 	}
 
-	go es.broadcastCallState(reg.userUuid, data)
+	go es.broadcastCallState(reg.userUuids, data)
 }
 
-// broadcastCallState sends a call state update to a specific user via the WebSocket worker.
-// Only targets by userUuid — call state updates go to the specific user who received the ring.
-func (es *EventSubscriber) broadcastCallState(userUuid string, data CallStateData) {
+// broadcastCallState sends a call state update to all users who received the ring.
+func (es *EventSubscriber) broadcastCallState(userUuids []string, data CallStateData) {
 	payload := BroadcastPayload{
-		UserUUID: userUuid,
-		Type:     "call_state",
-		Data:     data,
+		UserUUIDs: userUuids,
+		Type:      "call_state",
+		Data:      data,
 	}
 
 	body, err := json.Marshal(payload)
@@ -709,9 +722,13 @@ func (es *EventSubscriber) resolveUser(extension, domainName string) *userCacheE
 		return nil
 	}
 
+	users := make([]resolvedUser, len(results))
+	for i, r := range results {
+		users[i] = resolvedUser{userUuid: r.UserUUID, domainUuid: r.DomainUUID}
+	}
+
 	entry := &userCacheEntry{
-		userUuid:   results[0].UserUUID,
-		domainUuid: results[0].DomainUUID,
+		users:      users,
 		resolvedAt: time.Now(),
 	}
 
@@ -719,17 +736,21 @@ func (es *EventSubscriber) resolveUser(extension, domainName string) *userCacheE
 	es.userCache[cacheKey] = entry
 	es.userCacheMu.Unlock()
 
-	log.Printf("[Events] Resolved %s@%s → user %s", extension, domainName, entry.userUuid)
+	uuids := make([]string, len(users))
+	for i, u := range users {
+		uuids[i] = u.userUuid
+	}
+	log.Printf("[Events] Resolved %s@%s → %d users %v", extension, domainName, len(users), uuids)
 	return entry
 }
 
 // broadcastRing sends a user-targeted incoming_call event to the WebSocket worker.
-// Only targets by userUuid — call pops are for the specific user whose extension rings.
-func (es *EventSubscriber) broadcastRing(userUuid string, data RingCallData) {
+// Targets all users assigned to the ringing extension via userUuids batch matching.
+func (es *EventSubscriber) broadcastRing(userUuids []string, data RingCallData) {
 	payload := BroadcastPayload{
-		UserUUID: userUuid,
-		Type:     "incoming_call",
-		Data:     data,
+		UserUUIDs: userUuids,
+		Type:      "incoming_call",
+		Data:      data,
 	}
 
 	body, err := json.Marshal(payload)
@@ -757,7 +778,7 @@ func (es *EventSubscriber) broadcastRing(userUuid string, data RingCallData) {
 	if resp.StatusCode >= 400 {
 		log.Printf("[Events] Ring broadcast returned %d", resp.StatusCode)
 	} else {
-		log.Printf("[Events] Ring broadcast sent for %s → user %s", data.CallerIDNumber, userUuid)
+		log.Printf("[Events] Ring broadcast sent for %s → %d users %v", data.CallerIDNumber, len(userUuids), userUuids)
 	}
 }
 
