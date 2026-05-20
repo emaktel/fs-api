@@ -50,14 +50,49 @@ type BroadcastPayload struct {
 }
 
 // InboundCallData is the payload broadcast when an inbound a-leg is detected.
-// Field names use camelCase to match the WebSocket client's expected format.
 type InboundCallData struct {
 	CallUUID          string `json:"callUuid,omitempty"`
 	CallerIDNumber    string `json:"callerIdNumber"`
 	CallerIDName      string `json:"callerIdName,omitempty"`
 	DestinationNumber string `json:"destinationNumber"`
-	EventType         string `json:"event_type"`
+	EventType         string `json:"eventType"`
 	Timestamp         int64  `json:"timestamp"`
+}
+
+// CallStateData is broadcast when a tracked call's state changes (answered, hangup, etc.).
+type CallStateData struct {
+	CallUUID    string `json:"callUuid"`
+	State       string `json:"state"`
+	HangupCause string `json:"hangupCause,omitempty"`
+	Extension   string `json:"extension,omitempty"`
+	Timestamp   int64  `json:"timestamp"`
+}
+
+// RingCallData is the payload broadcast when a specific extension starts ringing.
+type RingCallData struct {
+	CallUUID          string `json:"callUuid,omitempty"`
+	CallerIDNumber    string `json:"callerIdNumber"`
+	CallerIDName      string `json:"callerIdName,omitempty"`
+	Extension         string `json:"extension"`
+	Domain            string `json:"domain"`
+	DestinationNumber string `json:"destinationNumber"`
+	Timestamp         int64  `json:"timestamp"`
+}
+
+// ringRegistration tracks a b-leg so answer/hangup events can be forwarded to the user.
+type ringRegistration struct {
+	userUuid   string
+	domainUuid string
+	callerID   string
+	extension  string
+	createdAt  time.Time
+}
+
+// userCacheEntry holds a resolved extension → user mapping with TTL.
+type userCacheEntry struct {
+	userUuid   string
+	domainUuid string
+	resolvedAt time.Time
 }
 
 // EventSubscriber manages ESL event subscription and call event forwarding.
@@ -73,11 +108,23 @@ type EventSubscriber struct {
 	inboundWebhookURL   string // POST inbound call data to this URL
 	inboundTopicPrefix  string // Broadcast topic prefix (e.g. "inbox:") — topic becomes "{prefix}{normalized_did}"
 
+	// User resolution config — resolves extension+domain → user for targeted call pops
+	resolveURL    string // REST endpoint that returns [{user_uuid, domain_uuid}] given extension + domain
+	resolveSecret string // Optional auth token for the resolve endpoint
+
 	mu       sync.RWMutex
 	registry map[string]*CallRegistration // call_uuid -> registration
 
 	inboundMu   sync.Mutex
 	seenInbound map[string]time.Time // deduplication for inbound a-legs
+
+	userCacheMu sync.RWMutex
+	userCache   map[string]*userCacheEntry // "domain:extension" -> resolved user
+
+	// ringRegistry tracks b-leg call UUIDs so we can forward answer/hangup events
+	// to the correct user. Populated on successful ring broadcast, cleaned up on CHANNEL_DESTROY.
+	ringMu       sync.RWMutex
+	ringRegistry map[string]*ringRegistration // b-leg call_uuid -> user target
 
 	conn *eslgo.Conn
 }
@@ -93,6 +140,9 @@ type EventSubscriberConfig struct {
 
 	InboundWebhookURL  string
 	InboundTopicPrefix string
+
+	ResolveURL    string
+	ResolveSecret string
 }
 
 func NewEventSubscriber(cfg EventSubscriberConfig) *EventSubscriber {
@@ -104,8 +154,12 @@ func NewEventSubscriber(cfg EventSubscriberConfig) *EventSubscriber {
 		broadcastSecret:    cfg.BroadcastSecret,
 		inboundWebhookURL:  cfg.InboundWebhookURL,
 		inboundTopicPrefix: cfg.InboundTopicPrefix,
+		resolveURL:         cfg.ResolveURL,
+		resolveSecret:      cfg.ResolveSecret,
 		registry:           make(map[string]*CallRegistration),
 		seenInbound:        make(map[string]time.Time),
+		userCache:          make(map[string]*userCacheEntry),
+		ringRegistry:       make(map[string]*ringRegistration),
 	}
 }
 
@@ -205,15 +259,26 @@ func (es *EventSubscriber) handleEvent(event *eslgo.Event) {
 		return
 	}
 
-	// Detect new inbound a-legs (external caller hitting a DID in the public context).
-	// This fires before ring groups, queues, or IVRs process the call.
 	if eventName == "CHANNEL_CREATE" {
 		direction := event.Headers.Get("Call-Direction")
 		callerContext := event.Headers.Get("Caller-Context")
 
+		// Detect new inbound a-legs (external caller hitting a DID in the public context).
+		// This fires before ring groups, queues, or IVRs process the call.
 		if direction == "inbound" && callerContext == "public" {
 			es.handleInboundALeg(event, callUUID)
 		}
+
+		// Detect b-legs ringing extensions (FreeSWITCH calling out to a user's phone).
+		// direction=outbound in a domain context means an extension is being rung.
+		if direction == "outbound" && callerContext != "public" && callerContext != "" {
+			es.handleExtensionRing(event, callUUID, callerContext)
+		}
+	}
+
+	// Forward answer/hangup/destroy events for tracked b-legs (extension ringing lifecycle)
+	if eventName == "CHANNEL_ANSWER" || eventName == "CHANNEL_HANGUP" || eventName == "CHANNEL_DESTROY" {
+		es.handleRingLifecycle(callUUID, eventName, event)
 	}
 
 	// Originated call tracking — only forward events for calls we started via /calls/originate
@@ -306,7 +371,7 @@ func (es *EventSubscriber) handleInboundALeg(event *eslgo.Event, callUUID string
 func (es *EventSubscriber) broadcastInboundCall(domainUUID, destinationNumber string, data InboundCallData) {
 	payload := BroadcastPayload{
 		DomainUUID: domainUUID,
-		Type:       "incoming_call",
+		Type:       "thread_event",
 		Data:       data,
 	}
 
@@ -442,6 +507,235 @@ func (es *EventSubscriber) callWebhook(callbackURL string, event CallEvent) {
 	defer resp.Body.Close()
 }
 
+// handleExtensionRing fires when a b-leg is created to ring a specific extension.
+// Resolves the extension to a user via the configured resolve URL, then broadcasts
+// a targeted incoming_call to that user only.
+func (es *EventSubscriber) handleExtensionRing(event *eslgo.Event, callUUID, domainName string) {
+	if es.broadcastURL == "" || es.resolveURL == "" {
+		return
+	}
+
+	extension := eslDecode(event.Headers.Get("Caller-Destination-Number"))
+	callerIDNumber := eslDecode(event.Headers.Get("Caller-Caller-ID-Number"))
+	callerIDName := eslDecode(event.Headers.Get("Caller-Caller-ID-Name"))
+
+	if extension == "" || callerIDNumber == "" {
+		return
+	}
+
+	log.Printf("[Events] Extension ring: %s → %s@%s (call %s)", callerIDNumber, extension, domainName, callUUID)
+
+	resolved := es.resolveUser(extension, domainName)
+	if resolved == nil {
+		return
+	}
+
+	// Register this b-leg so we can forward answer/hangup events to the same user
+	es.ringMu.Lock()
+	es.ringRegistry[callUUID] = &ringRegistration{
+		userUuid:   resolved.userUuid,
+		domainUuid: resolved.domainUuid,
+		callerID:   callerIDNumber,
+		extension:  extension,
+		createdAt:  time.Now(),
+	}
+	es.ringMu.Unlock()
+
+	data := RingCallData{
+		CallUUID:          callUUID,
+		CallerIDNumber:    callerIDNumber,
+		CallerIDName:      callerIDName,
+		Extension:         extension,
+		Domain:            domainName,
+		DestinationNumber: extension,
+		Timestamp:         time.Now().Unix(),
+	}
+
+	go es.broadcastRing(resolved.userUuid, resolved.domainUuid, data)
+}
+
+// handleRingLifecycle forwards answer/hangup events for tracked b-legs so the
+// client can update or dismiss the call pop in real time.
+func (es *EventSubscriber) handleRingLifecycle(callUUID, eventName string, event *eslgo.Event) {
+	es.ringMu.RLock()
+	reg, tracked := es.ringRegistry[callUUID]
+	es.ringMu.RUnlock()
+	if !tracked {
+		return
+	}
+
+	var state string
+	switch eventName {
+	case "CHANNEL_ANSWER":
+		state = "answered"
+	case "CHANNEL_HANGUP":
+		state = "hangup"
+	case "CHANNEL_DESTROY":
+		state = "destroy"
+	default:
+		return
+	}
+
+	hangupCause := ""
+	if eventName == "CHANNEL_HANGUP" || eventName == "CHANNEL_DESTROY" {
+		hangupCause = eslDecode(event.Headers.Get("Hangup-Cause"))
+	}
+
+	log.Printf("[Events] Call state %s for %s@%s → user %s (cause: %s)",
+		state, reg.extension, reg.callerID, reg.userUuid, hangupCause)
+
+	data := CallStateData{
+		CallUUID:    callUUID,
+		State:       state,
+		HangupCause: hangupCause,
+		Extension:   reg.extension,
+		Timestamp:   time.Now().Unix(),
+	}
+
+	go es.broadcastCallState(reg.userUuid, reg.domainUuid, data)
+
+	if eventName == "CHANNEL_DESTROY" {
+		es.ringMu.Lock()
+		delete(es.ringRegistry, callUUID)
+		es.ringMu.Unlock()
+	}
+}
+
+// broadcastCallState sends a call state update to a specific user via the WebSocket worker.
+func (es *EventSubscriber) broadcastCallState(userUuid, domainUuid string, data CallStateData) {
+	payload := BroadcastPayload{
+		UserUUID:   userUuid,
+		DomainUUID: domainUuid,
+		Type:       "call_state",
+		Data:       data,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+
+	req, err := http.NewRequest("POST", es.broadcastURL+"/broadcast", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if es.broadcastSecret != "" {
+		req.Header.Set("X-Worker-Auth", es.broadcastSecret)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[Events] Call state broadcast failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+}
+
+const userCacheTTL = 5 * time.Minute
+
+// resolveUser looks up the user for an extension via the configured resolve endpoint.
+// Results are cached to avoid per-call HTTP requests.
+func (es *EventSubscriber) resolveUser(extension, domainName string) *userCacheEntry {
+	cacheKey := domainName + ":" + extension
+
+	es.userCacheMu.RLock()
+	if entry, ok := es.userCache[cacheKey]; ok && time.Since(entry.resolvedAt) < userCacheTTL {
+		es.userCacheMu.RUnlock()
+		return entry
+	}
+	es.userCacheMu.RUnlock()
+
+	payload, err := json.Marshal(map[string]string{
+		"p_extension":   extension,
+		"p_domain_name": domainName,
+	})
+	if err != nil {
+		return nil
+	}
+
+	req, err := http.NewRequest("POST", es.resolveURL, bytes.NewReader(payload))
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if es.resolveSecret != "" {
+		req.Header.Set("Authorization", "Bearer "+es.resolveSecret)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[Events] Resolve user failed for %s@%s: %v", extension, domainName, err)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil
+	}
+
+	var results []struct {
+		UserUUID   string `json:"user_uuid"`
+		DomainUUID string `json:"domain_uuid"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil || len(results) == 0 {
+		return nil
+	}
+
+	entry := &userCacheEntry{
+		userUuid:   results[0].UserUUID,
+		domainUuid: results[0].DomainUUID,
+		resolvedAt: time.Now(),
+	}
+
+	es.userCacheMu.Lock()
+	es.userCache[cacheKey] = entry
+	es.userCacheMu.Unlock()
+
+	log.Printf("[Events] Resolved %s@%s → user %s", extension, domainName, entry.userUuid)
+	return entry
+}
+
+// broadcastRing sends a user-targeted incoming_call event to the WebSocket worker.
+func (es *EventSubscriber) broadcastRing(userUuid, domainUuid string, data RingCallData) {
+	payload := BroadcastPayload{
+		UserUUID:   userUuid,
+		DomainUUID: domainUuid,
+		Type:       "incoming_call",
+		Data:       data,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+
+	req, err := http.NewRequest("POST", es.broadcastURL+"/broadcast", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if es.broadcastSecret != "" {
+		req.Header.Set("X-Worker-Auth", es.broadcastSecret)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[Events] Ring broadcast failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		log.Printf("[Events] Ring broadcast returned %d", resp.StatusCode)
+	} else {
+		log.Printf("[Events] Ring broadcast sent for %s → user %s", data.CallerIDNumber, userUuid)
+	}
+}
+
 // cleanupStaleRegistrations removes entries older than maxAge to prevent memory leaks.
 func (es *EventSubscriber) cleanupStaleRegistrations(maxAge time.Duration) {
 	cutoff := time.Now().Add(-maxAge)
@@ -462,6 +756,22 @@ func (es *EventSubscriber) cleanupStaleRegistrations(maxAge time.Duration) {
 		}
 	}
 	es.inboundMu.Unlock()
+
+	es.userCacheMu.Lock()
+	for key, entry := range es.userCache {
+		if entry.resolvedAt.Before(cutoff) {
+			delete(es.userCache, key)
+		}
+	}
+	es.userCacheMu.Unlock()
+
+	es.ringMu.Lock()
+	for uuid, reg := range es.ringRegistry {
+		if reg.createdAt.Before(cutoff) {
+			delete(es.ringRegistry, uuid)
+		}
+	}
+	es.ringMu.Unlock()
 }
 
 // eslDecode URL-decodes ESL header values. FreeSWITCH ESL encodes special

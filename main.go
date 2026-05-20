@@ -26,6 +26,8 @@ var (
 	BROADCAST_SECRET       = getEnv("BROADCAST_SECRET", "")
 	INBOUND_WEBHOOK        = getEnv("INBOUND_WEBHOOK", "")
 	INBOUND_TOPIC_PREFIX   = getEnv("INBOUND_TOPIC_PREFIX", "")
+	RESOLVE_URL            = getEnv("RESOLVE_URL", "")
+	RESOLVE_SECRET         = getEnv("RESOLVE_SECRET", "")
 )
 
 func main() {
@@ -39,6 +41,8 @@ func main() {
 		BroadcastSecret:    BROADCAST_SECRET,
 		InboundWebhookURL:  INBOUND_WEBHOOK,
 		InboundTopicPrefix: INBOUND_TOPIC_PREFIX,
+		ResolveURL:         RESOLVE_URL,
+		ResolveSecret:      RESOLVE_SECRET,
 	})
 	handler.eventSubscriber = eventSub
 
@@ -126,6 +130,9 @@ func main() {
 	}
 	if INBOUND_TOPIC_PREFIX != "" {
 		log.Printf("Inbound call topic prefix: %q (broadcasts to %s{e164_number})", INBOUND_TOPIC_PREFIX, INBOUND_TOPIC_PREFIX)
+	}
+	if RESOLVE_URL != "" {
+		log.Printf("Extension user resolve URL: %s", RESOLVE_URL)
 	}
 	if INBOUND_WEBHOOK != "" {
 		log.Printf("Inbound call webhook: %s", INBOUND_WEBHOOK)
