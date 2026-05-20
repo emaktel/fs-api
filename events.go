@@ -126,6 +126,12 @@ type EventSubscriber struct {
 	ringMu       sync.RWMutex
 	ringRegistry map[string]*ringRegistration // b-leg call_uuid -> user target
 
+	// seenRing deduplicates ring broadcasts so each user gets at most one pop per
+	// inbound call, even when FreeSWITCH creates multiple b-legs for the same
+	// extension (ring groups, retries, simultaneous ring).
+	seenRingMu sync.Mutex
+	seenRing   map[string]time.Time // "aleg_uuid:user_uuid" -> first seen
+
 	conn *eslgo.Conn
 }
 
@@ -160,6 +166,7 @@ func NewEventSubscriber(cfg EventSubscriberConfig) *EventSubscriber {
 		seenInbound:        make(map[string]time.Time),
 		userCache:          make(map[string]*userCacheEntry),
 		ringRegistry:       make(map[string]*ringRegistration),
+		seenRing:           make(map[string]time.Time),
 	}
 }
 
@@ -529,12 +536,13 @@ func (es *EventSubscriber) handleExtensionRing(event *eslgo.Event, callUUID, dom
 	extension := eslDecode(event.Headers.Get("Caller-Destination-Number"))
 	callerIDNumber := eslDecode(event.Headers.Get("Caller-Caller-ID-Number"))
 	callerIDName := eslDecode(event.Headers.Get("Caller-Caller-ID-Name"))
+	alegUUID := event.Headers.Get("Other-Leg-Unique-ID")
 
 	if extension == "" || callerIDNumber == "" {
 		return
 	}
 
-	log.Printf("[Events] Extension ring: %s → %s@%s (call %s)", callerIDNumber, extension, domainName, callUUID)
+	log.Printf("[Events] Extension ring: %s → %s@%s (call %s, a-leg %s)", callerIDNumber, extension, domainName, callUUID, alegUUID)
 
 	resolved := es.resolveUser(extension, domainName)
 	if resolved == nil {
@@ -552,6 +560,20 @@ func (es *EventSubscriber) handleExtensionRing(event *eslgo.Event, callUUID, dom
 	}
 	es.ringMu.Unlock()
 
+	// Deduplicate: only one ring broadcast per user per inbound call.
+	// FreeSWITCH creates multiple b-legs for ring groups, retries, and
+	// simultaneous ring — each user should see at most one call pop.
+	if alegUUID != "" {
+		ringKey := alegUUID + ":" + resolved.userUuid
+		es.seenRingMu.Lock()
+		if _, seen := es.seenRing[ringKey]; seen {
+			es.seenRingMu.Unlock()
+			return
+		}
+		es.seenRing[ringKey] = time.Now()
+		es.seenRingMu.Unlock()
+	}
+
 	data := RingCallData{
 		CallUUID:          callUUID,
 		CallerIDNumber:    callerIDNumber,
@@ -562,7 +584,7 @@ func (es *EventSubscriber) handleExtensionRing(event *eslgo.Event, callUUID, dom
 		Timestamp:         time.Now().Unix(),
 	}
 
-	go es.broadcastRing(resolved.userUuid, resolved.domainUuid, data)
+	go es.broadcastRing(resolved.userUuid, data)
 }
 
 // handleRingLifecycle forwards answer/hangup events for tracked b-legs so the
@@ -601,16 +623,16 @@ func (es *EventSubscriber) handleRingLifecycle(callUUID, eventName string, event
 		Timestamp:   time.Now().Unix(),
 	}
 
-	go es.broadcastCallState(reg.userUuid, reg.domainUuid, data)
+	go es.broadcastCallState(reg.userUuid, data)
 }
 
 // broadcastCallState sends a call state update to a specific user via the WebSocket worker.
-func (es *EventSubscriber) broadcastCallState(userUuid, domainUuid string, data CallStateData) {
+// Only targets by userUuid — call state updates go to the specific user who received the ring.
+func (es *EventSubscriber) broadcastCallState(userUuid string, data CallStateData) {
 	payload := BroadcastPayload{
-		UserUUID:   userUuid,
-		DomainUUID: domainUuid,
-		Type:       "call_state",
-		Data:       data,
+		UserUUID: userUuid,
+		Type:     "call_state",
+		Data:     data,
 	}
 
 	body, err := json.Marshal(payload)
@@ -702,12 +724,12 @@ func (es *EventSubscriber) resolveUser(extension, domainName string) *userCacheE
 }
 
 // broadcastRing sends a user-targeted incoming_call event to the WebSocket worker.
-func (es *EventSubscriber) broadcastRing(userUuid, domainUuid string, data RingCallData) {
+// Only targets by userUuid — call pops are for the specific user whose extension rings.
+func (es *EventSubscriber) broadcastRing(userUuid string, data RingCallData) {
 	payload := BroadcastPayload{
-		UserUUID:   userUuid,
-		DomainUUID: domainUuid,
-		Type:       "incoming_call",
-		Data:       data,
+		UserUUID: userUuid,
+		Type:     "incoming_call",
+		Data:     data,
 	}
 
 	body, err := json.Marshal(payload)
@@ -775,6 +797,14 @@ func (es *EventSubscriber) cleanupStaleRegistrations(maxAge time.Duration) {
 		}
 	}
 	es.ringMu.Unlock()
+
+	es.seenRingMu.Lock()
+	for key, seen := range es.seenRing {
+		if seen.Before(cutoff) {
+			delete(es.seenRing, key)
+		}
+	}
+	es.seenRingMu.Unlock()
 }
 
 // eslDecode URL-decodes ESL header values. FreeSWITCH ESL encodes special
