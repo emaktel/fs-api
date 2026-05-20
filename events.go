@@ -276,9 +276,17 @@ func (es *EventSubscriber) handleEvent(event *eslgo.Event) {
 		}
 	}
 
-	// Forward answer/hangup/destroy events for tracked b-legs (extension ringing lifecycle)
-	if eventName == "CHANNEL_ANSWER" || eventName == "CHANNEL_HANGUP" || eventName == "CHANNEL_DESTROY" {
+	// Forward answer/hangup events for tracked b-legs (extension ringing lifecycle).
+	// CHANNEL_DESTROY is skipped — CHANNEL_HANGUP always fires first with the hangup cause.
+	if eventName == "CHANNEL_ANSWER" || eventName == "CHANNEL_HANGUP" {
 		es.handleRingLifecycle(callUUID, eventName, event)
+	}
+
+	// Clean up ring registry on destroy (no broadcast needed)
+	if eventName == "CHANNEL_DESTROY" {
+		es.ringMu.Lock()
+		delete(es.ringRegistry, callUUID)
+		es.ringMu.Unlock()
 	}
 
 	// Originated call tracking — only forward events for calls we started via /calls/originate
@@ -356,6 +364,9 @@ func (es *EventSubscriber) handleInboundALeg(event *eslgo.Event, callUUID string
 		Timestamp:         time.Now().Unix(),
 	}
 
+	// Broadcast to inbox topic so all users with access see the call arrive in real-time.
+	// The thread-relay sends a separate call_ended event after reconciliation with
+	// richer data (duration, status, recording) — both are needed.
 	if es.broadcastURL != "" {
 		go es.broadcastInboundCall(domainUUID, destinationNumber, data)
 	}
@@ -570,14 +581,12 @@ func (es *EventSubscriber) handleRingLifecycle(callUUID, eventName string, event
 		state = "answered"
 	case "CHANNEL_HANGUP":
 		state = "hangup"
-	case "CHANNEL_DESTROY":
-		state = "destroy"
 	default:
 		return
 	}
 
 	hangupCause := ""
-	if eventName == "CHANNEL_HANGUP" || eventName == "CHANNEL_DESTROY" {
+	if eventName == "CHANNEL_HANGUP" {
 		hangupCause = eslDecode(event.Headers.Get("Hangup-Cause"))
 	}
 
@@ -593,12 +602,6 @@ func (es *EventSubscriber) handleRingLifecycle(callUUID, eventName string, event
 	}
 
 	go es.broadcastCallState(reg.userUuid, reg.domainUuid, data)
-
-	if eventName == "CHANNEL_DESTROY" {
-		es.ringMu.Lock()
-		delete(es.ringRegistry, callUUID)
-		es.ringMu.Unlock()
-	}
 }
 
 // broadcastCallState sends a call state update to a specific user via the WebSocket worker.
