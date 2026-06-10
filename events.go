@@ -119,8 +119,8 @@ type EventSubscriber struct {
 	broadcastSecret string
 
 	// Inbound call notification config (optional, independent of originated call tracking)
-	inboundWebhookURL   string // POST inbound call data to this URL
-	inboundTopicPrefix  string // Broadcast topic prefix (e.g. "inbox:") — topic becomes "{prefix}{normalized_did}"
+	inboundWebhookURL  string // POST inbound call data to this URL
+	inboundTopicPrefix string // Broadcast topic prefix (e.g. "inbox:") — topic becomes "{prefix}{normalized_did}"
 
 	// User resolution config — resolves extension+domain → user for targeted call pops
 	resolveURL    string // REST endpoint that returns [{user_uuid, domain_uuid}] given extension + domain
@@ -147,6 +147,13 @@ type EventSubscriber struct {
 	seenRing   map[string]time.Time // "aleg_uuid:user_uuid" -> first seen
 
 	conn *eslgo.Conn
+
+	// ctx is the lifecycle context captured in Start; broadcast retry backoff
+	// sleeps observe it so they unblock immediately on shutdown.
+	ctx context.Context
+
+	// httpClient is shared by all worker broadcasts (5s timeout per attempt).
+	httpClient *http.Client
 }
 
 // EventSubscriberConfig holds configuration for the event subscriber.
@@ -181,6 +188,7 @@ func NewEventSubscriber(cfg EventSubscriberConfig) *EventSubscriber {
 		userCache:          make(map[string]*userCacheEntry),
 		ringRegistry:       make(map[string]*ringRegistration),
 		seenRing:           make(map[string]time.Time),
+		httpClient:         &http.Client{Timeout: 5 * time.Second},
 	}
 }
 
@@ -207,6 +215,7 @@ func (es *EventSubscriber) getRegistration(callUUID string) *CallRegistration {
 
 // Start connects to ESL and begins listening for events. Blocks until ctx is cancelled.
 func (es *EventSubscriber) Start(ctx context.Context) {
+	es.ctx = ctx
 	for {
 		select {
 		case <-ctx.Done():
@@ -397,6 +406,79 @@ func (es *EventSubscriber) handleInboundALeg(event *eslgo.Event, callUUID string
 	}
 }
 
+const broadcastMaxRetries = 3
+
+// broadcastRetryBaseDelay is the base for exponential backoff (500ms, 1s, 2s).
+// A var rather than a const so tests can shrink it; production never reassigns it.
+var broadcastRetryBaseDelay = 500 * time.Millisecond
+
+// sendBroadcast POSTs a payload to the WebSocket worker's /broadcast endpoint with
+// bounded exponential-backoff retry (3 attempts: 500ms, 1s, 2s). Network errors and
+// 5xx responses are retried; a 4xx is a permanent client error (bad/unauthorized
+// payload) and returns immediately without retrying. Returns nil on a 2xx response.
+// The label identifies the event type in retry logs.
+//
+// This is the single delivery path for every worker broadcast, so a momentary worker
+// outage (e.g. a deploy rollover) no longer permanently drops call events.
+func (es *EventSubscriber) sendBroadcast(label string, payload BroadcastPayload) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal %s: %w", label, err)
+	}
+
+	ctx := es.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	for attempt := 1; attempt <= broadcastMaxRetries; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "POST", es.broadcastURL+"/broadcast", bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("create %s request: %w", label, err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if es.broadcastSecret != "" {
+			req.Header.Set("X-Worker-Auth", es.broadcastSecret)
+		}
+
+		resp, err := es.httpClient.Do(req)
+		if err != nil {
+			log.Printf("[Events] %s broadcast attempt %d/%d failed: %v", label, attempt, broadcastMaxRetries, err)
+			if attempt < broadcastMaxRetries {
+				sleepCtx(ctx, broadcastRetryBaseDelay*time.Duration(1<<(attempt-1)))
+			}
+			continue
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return nil
+		}
+
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			return fmt.Errorf("%s broadcast: client error %d", label, resp.StatusCode)
+		}
+
+		log.Printf("[Events] %s broadcast attempt %d/%d: status %d", label, attempt, broadcastMaxRetries, resp.StatusCode)
+		if attempt < broadcastMaxRetries {
+			sleepCtx(ctx, broadcastRetryBaseDelay*time.Duration(1<<(attempt-1)))
+		}
+	}
+	return fmt.Errorf("%s broadcast: all %d attempts failed", label, broadcastMaxRetries)
+}
+
+// sleepCtx sleeps for d, returning early if ctx is cancelled.
+func sleepCtx(ctx context.Context, d time.Duration) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(d):
+	}
+}
+
 // broadcastInboundCall sends the inbound call event directly to the WebSocket worker.
 // If INBOUND_TOPIC_PREFIX is set (e.g. "inbox:"), the topic is "{prefix}{e164_number}",
 // enabling per-number subscriptions. Otherwise broadcasts to the domain.
@@ -412,35 +494,11 @@ func (es *EventSubscriber) broadcastInboundCall(domainUUID, destinationNumber st
 		payload.Topic = es.inboundTopicPrefix + normalized
 	}
 
-	body, err := json.Marshal(payload)
-	if err != nil {
-		log.Printf("[Events] Failed to marshal inbound broadcast: %v", err)
-		return
-	}
-
-	req, err := http.NewRequest("POST", es.broadcastURL+"/broadcast", bytes.NewReader(body))
-	if err != nil {
-		log.Printf("[Events] Failed to create inbound broadcast request: %v", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if es.broadcastSecret != "" {
-		req.Header.Set("X-Worker-Auth", es.broadcastSecret)
-	}
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
+	if err := es.sendBroadcast("inbound_call", payload); err != nil {
 		log.Printf("[Events] Inbound broadcast failed: %v", err)
 		return
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		log.Printf("[Events] Inbound broadcast returned %d", resp.StatusCode)
-	} else {
-		log.Printf("[Events] Inbound broadcast sent for %s → %s", data.CallerIDNumber, payload.Topic)
-	}
+	log.Printf("[Events] Inbound broadcast sent for %s → %s", data.CallerIDNumber, payload.Topic)
 }
 
 func (es *EventSubscriber) postInboundWebhook(data InboundCallData, domainUUID string) {
@@ -489,32 +547,8 @@ func (es *EventSubscriber) broadcastEvent(reg *CallRegistration, event CallEvent
 		Data:       event,
 	}
 
-	body, err := json.Marshal(payload)
-	if err != nil {
-		log.Printf("[Events] Failed to marshal broadcast: %v", err)
-		return
-	}
-
-	req, err := http.NewRequest("POST", es.broadcastURL+"/broadcast", bytes.NewReader(body))
-	if err != nil {
-		log.Printf("[Events] Failed to create broadcast request: %v", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if es.broadcastSecret != "" {
-		req.Header.Set("X-Worker-Auth", es.broadcastSecret)
-	}
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
+	if err := es.sendBroadcast("call_event", payload); err != nil {
 		log.Printf("[Events] Broadcast failed: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		log.Printf("[Events] Broadcast returned %d", resp.StatusCode)
 	}
 }
 
@@ -648,27 +682,9 @@ func (es *EventSubscriber) broadcastCallState(userUuids []string, data CallState
 		Data:      data,
 	}
 
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return
-	}
-
-	req, err := http.NewRequest("POST", es.broadcastURL+"/broadcast", bytes.NewReader(body))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if es.broadcastSecret != "" {
-		req.Header.Set("X-Worker-Auth", es.broadcastSecret)
-	}
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
+	if err := es.sendBroadcast("call_state", payload); err != nil {
 		log.Printf("[Events] Call state broadcast failed: %v", err)
-		return
 	}
-	defer resp.Body.Close()
 }
 
 const userCacheTTL = 5 * time.Minute
@@ -753,33 +769,11 @@ func (es *EventSubscriber) broadcastRing(userUuids []string, data RingCallData) 
 		Data:      data,
 	}
 
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return
-	}
-
-	req, err := http.NewRequest("POST", es.broadcastURL+"/broadcast", bytes.NewReader(body))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if es.broadcastSecret != "" {
-		req.Header.Set("X-Worker-Auth", es.broadcastSecret)
-	}
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
+	if err := es.sendBroadcast("incoming_call", payload); err != nil {
 		log.Printf("[Events] Ring broadcast failed: %v", err)
 		return
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		log.Printf("[Events] Ring broadcast returned %d", resp.StatusCode)
-	} else {
-		log.Printf("[Events] Ring broadcast sent for %s → %d users %v", data.CallerIDNumber, len(userUuids), userUuids)
-	}
+	log.Printf("[Events] Ring broadcast sent for %s → %d users %v", data.CallerIDNumber, len(userUuids), userUuids)
 }
 
 // cleanupStaleRegistrations removes entries older than maxAge to prevent memory leaks.
