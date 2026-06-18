@@ -341,6 +341,20 @@ components:
           type: string
           description: Dialplan context
 
+    ConferenceRequest:
+      type: object
+      required: [destination]
+      properties:
+        destination:
+          type: string
+          description: Extension or external number to add to the call's conference room
+        tollAllow:
+          type: string
+          description: >
+            The originating extension's toll/dial permission (comma-separated classes), set by
+            the caller so the loopback dial is gated by the same dialplan toll rules a normal
+            outbound call gets. Empty for internal-extension adds.
+
     BridgeRequest:
       type: object
       required: [uuid_a, uuid_b]
@@ -776,6 +790,48 @@ paths:
           $ref: "#/components/responses/NotFound"
         "502":
           $ref: "#/components/responses/BadGateway"
+
+  /v1/calls/{uuid}/conference:
+    post:
+      tags: [Calls]
+      summary: Add a participant to the call as a server-mixed conference ("add people")
+      description: >
+        On the first add, moves the call and its bridged partner into a per-call room on the
+        stock `default` conference profile (one `uuid_transfer -both`), then dials `destination`
+        into it via a loopback through the call's own dialplan context; subsequent adds reuse the
+        room. Uses the stock `default` profile, so no special conference config is required; the
+        join is verified and a 503 is returned if that profile is unavailable. The dial is
+        non-blocking — a 200 means the participant was queued, not yet connected.
+      operationId: addToConference
+      parameters:
+        - $ref: "#/components/parameters/CallUUID"
+        - $ref: "#/components/parameters/XAllowedContexts"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConferenceRequest"
+      responses:
+        "200":
+          description: Participant queued into the conference
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "502":
+          $ref: "#/components/responses/BadGateway"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /v1/calls/bridge:
     post:

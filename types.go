@@ -52,3 +52,13 @@ type OriginateRequest struct {
 	ChannelVariables map[string]interface{} `json:"channel_variables,omitempty"`
 	CallbackURL      string                 `json:"callback_url,omitempty"`
 }
+
+// ConferenceRequest is the body for POST /v1/calls/{uuid}/conference — the destination
+// (extension or external number) to add to the call's conference room. TollAllow is the
+// originating extension's toll/dial permission, forwarded by the SvelteKit layer so the
+// loopback dial is gated by the same dialplan toll rules a normal outbound call gets
+// (closing the conference dial-out toll-fraud gap). Empty for internal-extension adds.
+type ConferenceRequest struct {
+	Destination string `json:"destination"`
+	TollAllow   string `json:"tollAllow"`
+}

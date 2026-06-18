@@ -1108,3 +1108,255 @@ func (h *APIHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 		"version": Version,
 	})
 }
+
+// sanitizeDialDestination keeps only FreeSWITCH-safe dial characters (digits, +, *, #).
+// Defense-in-depth: the destination is interpolated into an `api conference … bgdial`
+// command, so any whitespace/quoting that could inject extra arguments is stripped. Returns
+// "" when nothing dialable remains or the value is over-long.
+func sanitizeDialDestination(raw string) string {
+	var b strings.Builder
+	for _, c := range raw {
+		if (c >= '0' && c <= '9') || c == '+' || c == '*' || c == '#' {
+			b.WriteRune(c)
+		}
+	}
+	s := b.String()
+	if len(s) == 0 || len(s) > 20 {
+		return ""
+	}
+	return s
+}
+
+// channelVar fetches a single channel variable, trimmed. Returns ("", nil) when the variable
+// is simply unset (FreeSWITCH "_undef_"), and a non-nil error on an ESL/command failure or a
+// FreeSWITCH "-ERR" (e.g. the channel is gone). Callers MUST distinguish "not set" from
+// "couldn't read" — for conference_name/bridge_uuid, treating a read error as "not conferenced"
+// would tear a live bridge or skip the partner move (SP-L12).
+func (h *APIHandler) channelVar(uuid, name string) (string, error) {
+	resp, err := h.eslClient.SendCommand(fmt.Sprintf("api uuid_getvar %s %s", uuid, name))
+	if err != nil {
+		return "", err
+	}
+	v := strings.TrimSpace(resp)
+	if strings.HasPrefix(v, "-ERR") {
+		return "", fmt.Errorf("uuid_getvar %s %s failed: %s", uuid, name, v)
+	}
+	if v == "_undef_" {
+		return "", nil
+	}
+	return v, nil
+}
+
+// sanitizeTollAllow keeps only characters valid in a toll_allow class list (alphanumerics,
+// comma, underscore, dash) so the value can't break out of the channel-variable syntax it's
+// interpolated into.
+func sanitizeTollAllow(raw string) string {
+	var b strings.Builder
+	for _, c := range raw {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ',' || c == '_' || c == '-' {
+			b.WriteRune(c)
+		}
+	}
+	return b.String()
+}
+
+// waitForConferenceJoin polls until every leg reports it has joined `room`. mod_conference sets
+// the channel variable conference_name on a member only AFTER the async join completes, so a
+// single immediate read races it; this polls (~150ms × 30 ≈ 4.5s budget) and returns true once
+// all legs are in, or false if the join never completes (profile missing/disabled, leg dropped).
+func (h *APIHandler) waitForConferenceJoin(legs []string, room string) bool {
+	const attempts = 30
+	const interval = 150 * time.Millisecond
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(interval)
+		}
+		allJoined := true
+		for _, leg := range legs {
+			name, err := h.channelVar(leg, "conference_name")
+			if err != nil || name != room {
+				allJoined = false
+				break
+			}
+		}
+		if allJoined {
+			return true
+		}
+	}
+	return false
+}
+
+// sanitizeCallerIDNumber keeps only valid caller-ID-number characters (digits and a leading
+// +). This both prevents argument injection and avoids spaces, which would break the bgdial
+// dialstring parsing.
+func sanitizeCallerIDNumber(raw string) string {
+	var b strings.Builder
+	for _, c := range raw {
+		if (c >= '0' && c <= '9') || c == '+' {
+			b.WriteRune(c)
+		}
+	}
+	return b.String()
+}
+
+// buildConferenceDialString builds the `conference … bgdial` participant dial string. The
+// loopback re-enters the call's own dialplan context, so internal/external routing and gateways
+// are handled exactly like a normal outbound call. Two vars are injected so the dialplan behaves
+// as if the originating extension placed the call:
+//   - toll_allow: the dialplan applies the SAME per-route toll gating a direct call would
+//     (SP-H2 toll-fraud parity).
+//   - outbound_caller_id_number: the originating extension's outbound DID, so the FusionPBX
+//     outbound route's `effective_caller_id_number=${outbound_caller_id_number}` presents a valid
+//     DID instead of the conference placeholder 0000000000 (which carriers 503).
+//
+// CRITICAL: both vars must reach the loopback leg that RUNS the dialplan, not just the leg that
+// returns to the conference. The dialstring `[vars]` apply to the originate (conference-facing)
+// leg, so we additionally set `loopback_export` — mod_loopback copies the listed vars onto the
+// dialplan leg. The alternate var delimiter (`^^:`) keeps comma-containing values (toll_allow,
+// the loopback_export list) intact. The caller-ID NAME is intentionally omitted: it can contain
+// spaces (which break the bgdial dialstring), and PSTN CNAM is resolved by the terminating
+// carrier from the number anyway.
+func buildConferenceDialString(tollAllow, cidNum, context, dest string) string {
+	var vars, exports []string
+	if t := sanitizeTollAllow(tollAllow); t != "" {
+		vars = append(vars, "toll_allow="+t)
+		exports = append(exports, "toll_allow")
+	}
+	if n := sanitizeCallerIDNumber(cidNum); n != "" {
+		vars = append(vars, "outbound_caller_id_number="+n)
+		exports = append(exports, "outbound_caller_id_number")
+	}
+	if len(vars) == 0 {
+		return fmt.Sprintf("loopback/%s/%s", dest, context)
+	}
+	// Prepend loopback_export so the vars propagate to the dialplan leg (A→B).
+	all := append([]string{"loopback_export=" + strings.Join(exports, ",")}, vars...)
+	return fmt.Sprintf("[^^:%s]loopback/%s/%s", strings.Join(all, ":"), dest, context)
+}
+
+// AddToConference turns the controlled call into (or extends) a server-mixed conference and
+// dials `destination` into it ("add people"). A bridge is strictly 2-party, so escalating a
+// 1:1 to 3+ needs a mixer — mod_conference. On the first add it moves the call AND its bridged
+// partner into a per-call ad-hoc room on the silent `softphone` conference profile; subsequent
+// adds reuse the room. The new participant is dialed via a loopback through the call's own
+// dialplan context (callInfo.AccountCode = the domain), so internal extensions and external
+// numbers route exactly as a normal outbound call (caller ID / gateways via the dialplan).
+//
+// Merge correctness (verified against FreeSWITCH source):
+//   - We do NOT use `uuid_transfer -both`: it resolves the partner from the SWITCH_BRIDGE_VARIABLE
+//     channel var and silently degrades to moving only one leg when that var is empty/stale,
+//     leaving the partner's bridge to end → hangup_after_bridge (default true) drops it. Instead
+//     we resolve the partner explicitly, pre-arm park_after_bridge=true on both legs (park is
+//     evaluated before hangup, so a torn-down leg is HELD not dropped), and transfer each leg.
+//   - uuid_transfer is ASYNC, so we POLL conference_name until both legs have joined rather than
+//     reading once (which races the join → false failure).
+//   - Joining via the `conference:` named-bridge form sets CFLAG_BRIDGE_TO, which (together with
+//     the silent profile) suppresses the "you are the only person" announcement / enter tones.
+func (h *APIHandler) AddToConference(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	callUUID := vars["uuid"]
+
+	if err := validateUUID(callUUID); err != nil {
+		h.respondError(w, r, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	callInfo, ok := h.validateCallContext(w, r, callUUID)
+	if !ok {
+		return
+	}
+
+	var req ConferenceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondError(w, r, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	dest := sanitizeDialDestination(req.Destination)
+	if dest == "" {
+		h.respondError(w, r, "destination is required", http.StatusBadRequest)
+		return
+	}
+
+	// SP-L13: the loopback dial routes in the call's domain context (AccountCode). An empty
+	// context would dial in the wrong/no context — refuse rather than dial blindly.
+	if strings.TrimSpace(callInfo.AccountCode) == "" {
+		h.respondError(w, r, "Call has no resolvable domain context", http.StatusBadGateway)
+		return
+	}
+
+	// Outbound caller ID for the dialed party = the originating extension's outbound DID, read
+	// from the controlling leg (a registered extension carries it as a directory var). The
+	// loopback otherwise re-enters the dialplan WITHOUT it, so the FusionPBX outbound route's
+	// `effective_caller_id_number=${outbound_caller_id_number}` resolves empty and the call goes
+	// out as the conference placeholder 0000000000 — which carriers reject (503). Best-effort:
+	// empty just falls back to prior behavior. Read before the transfers (var persists, but the
+	// controlling leg is unambiguous here).
+	outboundCid, _ := h.channelVar(callUUID, "outbound_caller_id_number")
+
+	// Silent ad-hoc conference profile (FusionPBX DB profile "softphone": no enter/exit tones, no
+	// "you are the only person" announcement, no MOH, no comfort noise) so a merge is seamless.
+	const conferenceProfile = "softphone"
+	room := "sp-" + callUUID
+
+	// If the call is already in a conference, reuse that room; otherwise move the live bridge
+	// into a new per-call room. A getvar error here is NOT "not conferenced" — fail fast (SP-L12).
+	existing, err := h.channelVar(callUUID, "conference_name")
+	if err != nil {
+		h.respondError(w, r, fmt.Sprintf("Failed to read call state: %v", err), http.StatusBadGateway)
+		return
+	}
+	if existing != "" {
+		room = existing
+	} else {
+		// Resolve the bridge partner explicitly (see the -both caveat in the doc comment). An
+		// empty partner is valid — a single, unbridged leg — not an error.
+		partner, perr := h.channelVar(callUUID, "bridge_uuid")
+		if perr != nil {
+			h.respondError(w, r, fmt.Sprintf("Failed to read call state: %v", perr), http.StatusBadGateway)
+			return
+		}
+		legs := []string{callUUID}
+		if partner != "" {
+			legs = append(legs, partner)
+		}
+
+		// Pre-arm hangup guards on every leg BEFORE transferring, so a leg whose bridge tears
+		// down mid-merge is parked (held) instead of hung up (park is evaluated before hangup).
+		for _, leg := range legs {
+			h.eslClient.SendCommand(fmt.Sprintf("api uuid_setvar %s park_after_bridge true", leg))
+			h.eslClient.SendCommand(fmt.Sprintf("api uuid_setvar %s hangup_after_bridge false", leg))
+		}
+
+		// Move each leg into the room explicitly via the `conference:` named-bridge form.
+		for _, leg := range legs {
+			if _, err := h.eslClient.SendCommand(fmt.Sprintf("api uuid_transfer %s conference:%s@%s inline", leg, room, conferenceProfile)); err != nil {
+				h.respondError(w, r, fmt.Sprintf("Failed to start conference: %v", err), h.getErrorStatusCode(err))
+				return
+			}
+		}
+
+		// uuid_transfer is async (+OK = queued, not joined), so POLL until every original leg
+		// reports conference_name == room. 503 only if the join never completes (e.g. the
+		// profile is missing/disabled) — never from reading too early (SP-H7, race-free).
+		if !h.waitForConferenceJoin(legs, room) {
+			h.respondError(w, r,
+				fmt.Sprintf("Conference join did not complete — the %q conference profile may be missing or disabled on this server", conferenceProfile),
+				http.StatusServiceUnavailable)
+			return
+		}
+	}
+
+	// SP-H2: forward the originating extension's toll_allow (so the dialplan gates the loopback
+	// dial like a normal outbound call) + its outbound caller-ID DID (so the carrier accepts it).
+	dialString := buildConferenceDialString(req.TollAllow, outboundCid, callInfo.AccountCode, dest)
+	if _, err := h.eslClient.SendCommand(fmt.Sprintf("api conference %s bgdial %s", room, dialString)); err != nil {
+		h.respondError(w, r, fmt.Sprintf("Failed to add participant: %v", err), h.getErrorStatusCode(err))
+		return
+	}
+
+	// SP-M5: bgdial is non-blocking (returns a Job-UUID immediately), so success here means
+	// "queued", not "connected" — invalid/busy/no-answer surface later via conference events.
+	// The message reflects that honestly rather than claiming the party is in the call.
+	h.respondSuccess(w, r, fmt.Sprintf("Queued %s into conference %s", dest, room))
+}

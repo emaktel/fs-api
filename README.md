@@ -8,8 +8,8 @@ This service provides a simple, stateless HTTP API for controlling FreeSWITCH ca
 
 ## Features
 
-- **33 API Endpoints**: 9 Call Control + 3 Query + 2 Registrations + 19 Callcenter Management
-  - Call Control: Hangup, Transfer, Bridge, Answer, Hold/Unhold, Record, DTMF, Park, Originate
+- **34 API Endpoints**: 10 Call Control + 3 Query + 2 Registrations + 19 Callcenter Management
+  - Call Control: Hangup, Transfer, Bridge, Answer, Hold/Unhold, Record, DTMF, Park, Originate, Conference (add-people)
   - Query: List Calls, Call Details, FreeSWITCH Status
   - Registrations: List and count active SIP registrations, filtered by realm/domain
   - Callcenter: Queue CRUD, Agent CRUD, Tier CRUD, Member listing, counts
@@ -305,6 +305,7 @@ The following endpoints enforce context authorization when `X-Allowed-Contexts` 
 - ✅ `POST /v1/calls/{uuid}/record` - Start/stop recording
 - ✅ `POST /v1/calls/{uuid}/dtmf` - Send DTMF
 - ✅ `POST /v1/calls/{uuid}/park` - Park call
+- ✅ `POST /v1/calls/{uuid}/conference` - Add a participant ("add people"); uses the stock `default` conference profile and forwards the originating extension's `toll_allow` so external dial-out is gated like a normal call
 - ✅ `POST /v1/calls/bridge` - Bridge two calls (validates both UUIDs)
 - ✅ `POST /v1/calls/originate` - Originate call (validates context parameter)
 - ✅ All `/v1/callcenter/queues/*` endpoints - Validated by queue `name@domain`
@@ -856,7 +857,59 @@ curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcde
 
 ---
 
-### 11. Originate Call
+### 11. Add to Conference
+Merge a call (and its bridged partner) into a server-mixed conference room and dial an additional
+participant into it ("add people"). On the first call this moves both legs of the bridge into a
+per-call room on the stock `default` conference profile in one `uuid_transfer -both`; subsequent
+calls reuse that room. (Bridging is 2-party; 3+ parties need a mixer — `mod_conference` — so this
+is the standard way to escalate a 1:1 to n-way.)
+
+```bash
+POST /v1/calls/{uuid}/conference
+```
+
+**Request Body**:
+```json
+{
+  "destination": "200",
+  "tollAllow": "domestic,international"
+}
+```
+
+**Parameters**:
+- `destination` (required): Extension or external number to add (sanitized to digits, `+`, `*`, `#`)
+- `tollAllow` (optional): The originating extension's toll/dial classes, forwarded as a channel
+  variable so the dialplan gates external dial-out exactly like a normal outbound call. Empty
+  (or omitted) for internal-extension adds.
+
+**Example**:
+```bash
+curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcdef/conference \
+  -H "Content-Type: application/json" \
+  -H "X-Allowed-Contexts: customer1.example.com" \
+  -d '{"destination":"200"}'
+```
+
+**Response**:
+```json
+{
+  "status": "success",
+  "message": "Queued 200 into conference sp-a1b2c3d4-e5f6-7890-1234-567890abcdef"
+}
+```
+
+**Notes**:
+- Uses the stock **`default`** conference profile — present in every FusionPBX/FreeSWITCH install,
+  so no special config is required. The endpoint still verifies the join (re-reads `conference_name`)
+  and returns `503` if the profile is somehow unavailable, rather than silently dropping the call.
+- Both legs are moved with a single `uuid_transfer <uuid> -both conference:<room>@default inline`,
+  so there's no interior state where one leg is moved and the other can be dropped.
+- Participants are dialed via background `conference … bgdial`, so `200` means **queued** —
+  routing/answer outcomes arrive asynchronously (e.g. via conference events), not in this response.
+
+---
+
+### 12. Originate Call
 Initiate a new call between two endpoints.
 
 ```bash
@@ -935,7 +988,7 @@ curl -X POST http://localhost:37274/v1/calls/originate \
 
 ---
 
-### 12. Get FreeSWITCH Status
+### 13. Get FreeSWITCH Status
 Retrieve detailed status information from the FreeSWITCH server.
 
 ```bash
