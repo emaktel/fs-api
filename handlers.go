@@ -560,10 +560,16 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 		vars = append(vars, fmt.Sprintf("origination_caller_id_name='%s'", req.CallerIDName))
 	}
 
-	var channelVars string
-	if len(vars) > 0 {
-		channelVars = fmt.Sprintf("{%s}", strings.Join(vars, ","))
-	}
+	// The ring timeout also goes in as originate_timeout, first in the {..}
+	// list (callers can't set it: originate_input.go). FreeSWITCH's user/,
+	// group/ and verto endpoints ring through an inner originate of their own,
+	// before the outer one starts timing, with their own 60 s default unless
+	// originate_timeout is in the variables they inherit (switch_ivr_originate.c
+	// reads it over its timelimit argument). Without it, a user/ A-leg rang
+	// 60 s whatever timeout_sec said.
+	ringTimeoutSec := originateTimeoutSec(req.TimeoutSec)
+	vars = append([]string{fmt.Sprintf("originate_timeout=%d", ringTimeoutSec)}, vars...)
+	channelVars := fmt.Sprintf("{%s}", strings.Join(vars, ","))
 
 	// Build the originate command. FreeSWITCH reads originate's optional
 	// arguments by position (mod_commands.c originate_function:
@@ -573,7 +579,6 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 	// seventh argument and FreeSWITCH gives up exactly when this handler's
 	// deadline expects. Caller ID is sent as origination_caller_id_* channel
 	// variables (above), so its two slots are always undef.
-	ringTimeoutSec := originateTimeoutSec(req.TimeoutSec)
 	var cmd strings.Builder
 	fmt.Fprintf(&cmd, "originate %s%s %s %s %s undef undef %d",
 		channelVars, req.ALeg, originateBLegArg(req.BLeg), orUndef(req.Dialplan), orUndef(req.Context), ringTimeoutSec)

@@ -409,7 +409,10 @@ components:
           type: string
           description: >
             A-leg dial string. No spaces, control characters, quotes,
-            backslashes or inline variables (`{ } [ ] < >`); refused with 400.
+            backslashes or inline variables (`{ } [ ] < >`), and nothing that
+            rings legs one after another: `|` (serial failover), `$`
+            (variable expansion), or the `group/` and `lcr/` endpoints.
+            Parallel `,` and enterprise `:_:` are allowed. Refused with 400.
         bleg:
           type: string
           description: >
@@ -442,7 +445,7 @@ components:
           description: >
             Additional FreeSWITCH channel variables. Variables that change
             originate timing or retries are refused (400, any case):
-            `originate_timeout`, `leg_timeout`, `leg_progress_timeout`,
+            `originate_timeout`, `call_timeout`, `leg_timeout`, `leg_progress_timeout`,
             `progress_timeout`, `originate_retries`, `originate_retry_sleep_ms`,
             `originate_retry_min_period_ms`, `originate_retry_timeout`,
             `originate_continue_on_timeout`, `originate_delay_start`,

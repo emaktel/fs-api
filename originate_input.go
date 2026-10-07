@@ -30,6 +30,7 @@ import (
 // or retries. Compared case-insensitively.
 var originateTimingVars = map[string]bool{
 	"originate_timeout":             true,
+	"call_timeout":                  true, // SWITCH_CALL_TIMEOUT_VARIABLE, read by the user/ group/ lcr/ endpoints
 	"leg_timeout":                   true,
 	"leg_progress_timeout":          true,
 	"progress_timeout":              true,
@@ -73,6 +74,9 @@ func validateOriginateInput(req *OriginateRequest) ([]string, error) {
 	if hasSpaceOrControl(req.ALeg) || strings.ContainsAny(req.ALeg, inlineVarChars+retokenizeChars+"^") {
 		return nil, fmt.Errorf("aleg must be a dial string without spaces, quotes, backslashes or inline variables ({ } [ ] < >)")
 	}
+	if err := checkALegTiming(req.ALeg); err != nil {
+		return nil, err
+	}
 	if hasControl(req.BLeg) || strings.ContainsAny(req.BLeg, inlineVarChars+retokenizeChars) {
 		return nil, fmt.Errorf("bleg may not contain quotes, backslashes, control characters or inline variables ({ } [ ] < >)")
 	}
@@ -112,4 +116,36 @@ func originateBLegArg(bleg string) string {
 		return "'" + bleg + "'"
 	}
 	return bleg
+}
+
+// serialEndpoints run their own serial failover inside one leg: group/ (a
+// +F group expands to a "|" list) and lcr/ (routes tried in turn), each
+// route getting the full ring timeout (mod_dptools group_outgoing_channel,
+// mod_lcr lcr_outgoing_channel).
+var serialEndpoints = []string{"group/", "lcr/"}
+
+// checkALegTiming refuses dial strings whose legs can ring one after another,
+// each for the full ring timeout, so the total outlasts the deadline:
+//   - "|" is serial failover (switch_ivr_originate.c splits on it and gives
+//     every try the whole timelimit);
+//   - "$" expands variables or API calls (e.g. ${group_call(...+F)}) into
+//     such a list after this check;
+//   - group/ and lcr/ endpoints fail over serially inside one leg.
+//
+// "," (parallel) and ":_:" (enterprise: parallel threads sharing the
+// timelimit) stay allowed.
+func checkALegTiming(aleg string) error {
+	if strings.ContainsAny(aleg, "|$") {
+		return fmt.Errorf("aleg may not contain | (serial failover) or $ (variable expansion)")
+	}
+	for _, ent := range strings.Split(aleg, ":_:") {
+		for _, leg := range strings.Split(ent, ",") {
+			for _, ep := range serialEndpoints {
+				if strings.HasPrefix(strings.ToLower(leg), ep) {
+					return fmt.Errorf("aleg may not use the %s endpoint (serial failover)", ep)
+				}
+			}
+		}
+	}
+	return nil
 }

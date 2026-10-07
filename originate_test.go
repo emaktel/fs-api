@@ -130,7 +130,7 @@ func TestOriginateRegistersTheAnsweringForkLeg(t *testing.T) {
 		t.Fatalf("registry = %+v", registeredCalls(es))
 	}
 	cmds := fs.commands()
-	if len(cmds) != 2 || strings.Contains(cmds[1], "origination_uuid") || cmds[1] != "1:api originate user/101@acme.example.com &park() undef undef undef undef 60" {
+	if len(cmds) != 2 || strings.Contains(cmds[1], "origination_uuid") || cmds[1] != "1:api originate {originate_timeout=60}user/101@acme.example.com &park() undef undef undef undef 60" {
 		t.Fatalf("commands = %q", cmds)
 	}
 }
@@ -146,7 +146,7 @@ func TestOriginatePassesCallerOriginationUUIDThrough(t *testing.T) {
 	if rec.Code != http.StatusOK || registeredCalls(es)[fxCallX] == nil {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
-	if cmd := fs.commands()[1]; cmd != "1:api originate {origination_uuid="+fxCallX+"}user/101@acme.example.com &park() undef undef undef undef 60" {
+	if cmd := fs.commands()[1]; cmd != "1:api originate {originate_timeout=60,origination_uuid="+fxCallX+"}user/101@acme.example.com &park() undef undef undef undef 60" {
 		t.Fatalf("command %q", cmd)
 	}
 }
@@ -349,18 +349,18 @@ func TestOriginateCommandArguments(t *testing.T) {
 		want string
 	}{
 		{"none", map[string]any{"aleg": aleg},
-			"originate user/101@acme.example.com &park() undef undef undef undef 60"},
+			"originate {originate_timeout=60}user/101@acme.example.com &park() undef undef undef undef 60"},
 		{"timeout only", map[string]any{"aleg": aleg, "timeout_sec": 10},
-			"originate user/101@acme.example.com &park() undef undef undef undef 10"},
+			"originate {originate_timeout=10}user/101@acme.example.com &park() undef undef undef undef 10"},
 		{"context only", map[string]any{"aleg": aleg, "context": "acme.example.com"},
-			"originate user/101@acme.example.com &park() undef acme.example.com undef undef 60"},
+			"originate {originate_timeout=60}user/101@acme.example.com &park() undef acme.example.com undef undef 60"},
 		{"dialplan only", map[string]any{"aleg": aleg, "dialplan": "XML"},
-			"originate user/101@acme.example.com &park() XML undef undef undef 60"},
+			"originate {originate_timeout=60}user/101@acme.example.com &park() XML undef undef undef 60"},
 		{"cid only", map[string]any{"aleg": aleg, "caller_id_name": "Front Desk", "caller_id_number": "5145550100"},
-			"originate {origination_caller_id_number=5145550100,origination_caller_id_name='Front Desk'}user/101@acme.example.com &park() undef undef undef undef 60"},
+			"originate {originate_timeout=60,origination_caller_id_number=5145550100,origination_caller_id_name='Front Desk'}user/101@acme.example.com &park() undef undef undef undef 60"},
 		{"all", map[string]any{"aleg": aleg, "bleg": "5145550199", "dialplan": "XML", "context": "acme.example.com",
 			"caller_id_name": "Front Desk", "caller_id_number": "5145550100", "timeout_sec": 25},
-			"originate {origination_caller_id_number=5145550100,origination_caller_id_name='Front Desk'}user/101@acme.example.com 5145550199 XML acme.example.com undef undef 25"},
+			"originate {originate_timeout=25,origination_caller_id_number=5145550100,origination_caller_id_name='Front Desk'}user/101@acme.example.com 5145550199 XML acme.example.com undef undef 25"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := newFakeFreeSWITCH(t, "ClueCon-test", replyWith("+OK "+fxCallX+"\n"))
@@ -372,9 +372,10 @@ func TestOriginateCommandArguments(t *testing.T) {
 			if len(cmds) != 2 || cmds[1] != "1:api "+tc.want {
 				t.Fatalf("command\n got: %q\nwant: %q", cmds, "1:api "+tc.want)
 			}
-			// FreeSWITCH sees exactly seven arguments, the ring timeout last.
+			// FreeSWITCH sees exactly seven arguments, the ring timeout last,
+			// and the same timeout first in the variables every endpoint inherits.
 			args := fsOriginateArgs(t, tc.want)
-			if fields := strings.Fields(tc.want); len(args) != 7 || args[6] != fields[len(fields)-1] {
+			if fields := strings.Fields(tc.want); len(args) != 7 || args[6] != fields[len(fields)-1] || !strings.HasPrefix(args[0], "{originate_timeout="+args[6]) {
 				t.Fatalf("FreeSWITCH would see %d args %q", len(args), args)
 			}
 		})
@@ -433,7 +434,7 @@ func TestOriginateChromeExtensionRequest(t *testing.T) {
 	if rec.Code != http.StatusOK || registeredCalls(es)[fxCallX] == nil {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
-	want := "originate {origination_caller_id_number=5145550199,origination_caller_id_name='5145550199'}user/101@acme.example.com '&transfer(5145550199 XML acme.example.com)' undef undef undef undef 30"
+	want := "originate {originate_timeout=30,origination_caller_id_number=5145550199,origination_caller_id_name='5145550199'}user/101@acme.example.com '&transfer(5145550199 XML acme.example.com)' undef undef undef undef 30"
 	cmd := strings.TrimPrefix(fs.commands()[1], "1:api ")
 	if cmd != want {
 		t.Fatalf("command\n got: %q\nwant: %q", cmd, want)
@@ -450,32 +451,38 @@ func TestOriginateChromeExtensionRequest(t *testing.T) {
 func TestOriginateRefusesTimeoutOverrides(t *testing.T) {
 	const aleg = "user/101@acme.example.com"
 	cases := map[string]map[string]any{
-		"aleg {originate_timeout}": {"aleg": "{originate_timeout=300}" + aleg},
-		"aleg [leg_timeout]":       {"aleg": "[leg_timeout=300]" + aleg},
-		"aleg <leg_timeout>":       {"aleg": "<leg_timeout=300>" + aleg},
-		"aleg space":               {"aleg": aleg + " 300"},
-		"aleg tab":                 {"aleg": aleg + "\t300"},
-		"aleg newline":             {"aleg": aleg + "\n"},
-		"aleg quote":               {"aleg": aleg + "'"},
-		"aleg backslash":           {"aleg": aleg + `\ 300`},
-		"aleg delimiter switch":    {"aleg": "^^:" + aleg},
-		"bleg {originate_timeout}": {"aleg": aleg, "bleg": "{originate_timeout=300}&park()"},
-		"bleg [leg_timeout]":       {"aleg": aleg, "bleg": "[leg_timeout=300]1001"},
-		"bleg space, not an app":   {"aleg": aleg, "bleg": "1001 XML ctx undef undef 300"},
-		"bleg app plus extra args": {"aleg": aleg, "bleg": "&park() undef undef undef undef 300"},
-		"bleg quote":               {"aleg": aleg, "bleg": "&transfer('1001 XML ctx')"},
-		"bleg control":             {"aleg": aleg, "bleg": "&park()\r"},
-		"dialplan space":           {"aleg": aleg, "dialplan": "XML 300"},
-		"context space":            {"aleg": aleg, "context": "acme undef undef 300"},
-		"context control":          {"aleg": aleg, "context": "acme\x00"},
-		"caller_id_number space":   {"aleg": aleg, "caller_id_number": "514 555"},
-		"caller_id_number comma":   {"aleg": aleg, "caller_id_number": "1,originate_timeout=300"},
-		"caller_id_name quote":     {"aleg": aleg, "caller_id_name": "x' undef 300 '"},
-		"caller_id_name comma":     {"aleg": aleg, "caller_id_name": "x,originate_timeout=300"},
-		"value injects a key":      {"aleg": aleg, "channel_variables": map[string]any{"foo": "1,originate_timeout=300"}},
-		"value with space":         {"aleg": aleg, "channel_variables": map[string]any{"foo": "a b"}},
-		"key with =":               {"aleg": aleg, "channel_variables": map[string]any{"originate_timeout=300,foo": "1"}},
-		"value is an object":       {"aleg": aleg, "channel_variables": map[string]any{"foo": map[string]any{"a": 1}}},
+		"aleg {originate_timeout}":    {"aleg": "{originate_timeout=300}" + aleg},
+		"aleg [leg_timeout]":          {"aleg": "[leg_timeout=300]" + aleg},
+		"aleg <leg_timeout>":          {"aleg": "<leg_timeout=300>" + aleg},
+		"aleg space":                  {"aleg": aleg + " 300"},
+		"aleg tab":                    {"aleg": aleg + "\t300"},
+		"aleg newline":                {"aleg": aleg + "\n"},
+		"aleg quote":                  {"aleg": aleg + "'"},
+		"aleg backslash":              {"aleg": aleg + `\ 300`},
+		"aleg delimiter switch":       {"aleg": "^^:" + aleg},
+		"aleg serial failover":        {"aleg": aleg + "|user/102@acme.example.com"},
+		"aleg failover in enterprise": {"aleg": aleg + ":_:user/102@acme.example.com|user/103@acme.example.com"},
+		"aleg variable expansion":     {"aleg": "${group_call(sales@acme.example.com+F)}"},
+		"aleg group/ endpoint":        {"aleg": "group/sales@acme.example.com"},
+		"aleg GROUP/ after a comma":   {"aleg": aleg + ",GROUP/sales@acme.example.com"},
+		"aleg lcr/ in enterprise":     {"aleg": aleg + ":_:lcr/5145550199"},
+		"bleg {originate_timeout}":    {"aleg": aleg, "bleg": "{originate_timeout=300}&park()"},
+		"bleg [leg_timeout]":          {"aleg": aleg, "bleg": "[leg_timeout=300]1001"},
+		"bleg space, not an app":      {"aleg": aleg, "bleg": "1001 XML ctx undef undef 300"},
+		"bleg app plus extra args":    {"aleg": aleg, "bleg": "&park() undef undef undef undef 300"},
+		"bleg quote":                  {"aleg": aleg, "bleg": "&transfer('1001 XML ctx')"},
+		"bleg control":                {"aleg": aleg, "bleg": "&park()\r"},
+		"dialplan space":              {"aleg": aleg, "dialplan": "XML 300"},
+		"context space":               {"aleg": aleg, "context": "acme undef undef 300"},
+		"context control":             {"aleg": aleg, "context": "acme\x00"},
+		"caller_id_number space":      {"aleg": aleg, "caller_id_number": "514 555"},
+		"caller_id_number comma":      {"aleg": aleg, "caller_id_number": "1,originate_timeout=300"},
+		"caller_id_name quote":        {"aleg": aleg, "caller_id_name": "x' undef 300 '"},
+		"caller_id_name comma":        {"aleg": aleg, "caller_id_name": "x,originate_timeout=300"},
+		"value injects a key":         {"aleg": aleg, "channel_variables": map[string]any{"foo": "1,originate_timeout=300"}},
+		"value with space":            {"aleg": aleg, "channel_variables": map[string]any{"foo": "a b"}},
+		"key with =":                  {"aleg": aleg, "channel_variables": map[string]any{"originate_timeout=300,foo": "1"}},
+		"value is an object":          {"aleg": aleg, "channel_variables": map[string]any{"foo": map[string]any{"a": 1}}},
 	}
 	for v := range originateTimingVars {
 		cases["timing var "+v] = map[string]any{"aleg": aleg, "channel_variables": map[string]any{v: 300}}
@@ -501,6 +508,7 @@ func TestOriginateRefusesTimeoutOverrides(t *testing.T) {
 func TestOriginateAcceptsOrdinaryInput(t *testing.T) {
 	for name, body := range map[string]map[string]any{
 		"forked aleg":       {"aleg": "user/101@acme.example.com,user/102@acme.example.com"},
+		"enterprise aleg":   {"aleg": "user/101@acme.example.com:_:user/102@acme.example.com"},
 		"gateway aleg":      {"aleg": "sofia/gateway/carrier/+15145550199"},
 		"plain bleg":        {"aleg": "user/101@acme.example.com", "bleg": "5145550199"},
 		"app without args":  {"aleg": "user/101@acme.example.com", "bleg": "&echo"},
@@ -513,7 +521,7 @@ func TestOriginateAcceptsOrdinaryInput(t *testing.T) {
 			if rec := originate(t, h, fxUser1, fxDomainA, body); rec.Code != http.StatusOK {
 				t.Fatalf("status %d: %s", rec.Code, rec.Body)
 			}
-			if args := fsOriginateArgs(t, strings.TrimPrefix(fs.commands()[1], "1:api ")); len(args) != 7 || args[6] != "60" {
+			if args := fsOriginateArgs(t, strings.TrimPrefix(fs.commands()[1], "1:api ")); len(args) != 7 || args[6] != "60" || !strings.HasPrefix(args[0], "{originate_timeout=60") {
 				t.Fatalf("FreeSWITCH would see %d args %q", len(args), args)
 			}
 		})
