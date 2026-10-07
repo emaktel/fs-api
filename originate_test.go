@@ -357,10 +357,10 @@ func TestOriginateCommandArguments(t *testing.T) {
 		{"dialplan only", map[string]any{"aleg": aleg, "dialplan": "XML"},
 			"originate {originate_timeout=60}user/101@acme.example.com &park() XML undef undef undef 60"},
 		{"cid only", map[string]any{"aleg": aleg, "caller_id_name": "Front Desk", "caller_id_number": "5145550100"},
-			"originate {originate_timeout=60,origination_caller_id_number=5145550100,origination_caller_id_name='Front Desk'}user/101@acme.example.com &park() undef undef undef undef 60"},
+			"originate {originate_timeout=60,origination_caller_id_number=5145550100,origination_caller_id_name=Front\\sDesk}user/101@acme.example.com &park() undef undef undef undef 60"},
 		{"all", map[string]any{"aleg": aleg, "bleg": "5145550199", "dialplan": "XML", "context": "acme.example.com",
 			"caller_id_name": "Front Desk", "caller_id_number": "5145550100", "timeout_sec": 25},
-			"originate {originate_timeout=25,origination_caller_id_number=5145550100,origination_caller_id_name='Front Desk'}user/101@acme.example.com 5145550199 XML acme.example.com undef undef 25"},
+			"originate {originate_timeout=25,origination_caller_id_number=5145550100,origination_caller_id_name=Front\\sDesk}user/101@acme.example.com 5145550199 XML acme.example.com undef undef 25"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := newFakeFreeSWITCH(t, "ClueCon-test", replyWith("+OK "+fxCallX+"\n"))
@@ -382,41 +382,6 @@ func TestOriginateCommandArguments(t *testing.T) {
 	}
 }
 
-// fsOriginateArgs splits an `api originate` argument string the way
-// FreeSWITCH does (switch_utils.c separate_string_blank_delim +
-// cleanup_separated_string: spaces separate, single quotes group and are
-// stripped; this test only ever sees inputs without backslashes or "^^").
-func fsOriginateArgs(t *testing.T, cmd string) []string {
-	t.Helper()
-	rest, ok := strings.CutPrefix(cmd, "originate ")
-	if !ok {
-		t.Fatalf("not an originate: %q", cmd)
-	}
-	var args []string
-	var cur strings.Builder
-	inQuotes, inToken := false, false
-	for _, r := range rest {
-		switch {
-		case r == '\'':
-			inQuotes = !inQuotes
-			inToken = true
-		case r == ' ' && !inQuotes:
-			if inToken {
-				args = append(args, cur.String())
-				cur.Reset()
-				inToken = false
-			}
-		default:
-			cur.WriteRune(r)
-			inToken = true
-		}
-	}
-	if inToken {
-		args = append(args, cur.String())
-	}
-	return args
-}
-
 // The Chrome extension's real request: its &transfer(dest XML domain) B-leg
 // has spaces, so it is sent single-quoted as one argument, and FreeSWITCH sees
 // exactly seven arguments with the requested ring timeout last. (Unquoted, the
@@ -434,7 +399,7 @@ func TestOriginateChromeExtensionRequest(t *testing.T) {
 	if rec.Code != http.StatusOK || registeredCalls(es)[fxCallX] == nil {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
-	want := "originate {originate_timeout=30,origination_caller_id_number=5145550199,origination_caller_id_name='5145550199'}user/101@acme.example.com '&transfer(5145550199 XML acme.example.com)' undef undef undef undef 30"
+	want := "originate {originate_timeout=30,origination_caller_id_number=5145550199,origination_caller_id_name=5145550199}user/101@acme.example.com '&transfer(5145550199 XML acme.example.com)' undef undef undef undef 30"
 	cmd := strings.TrimPrefix(fs.commands()[1], "1:api ")
 	if cmd != want {
 		t.Fatalf("command\n got: %q\nwant: %q", cmd, want)
@@ -482,8 +447,7 @@ func TestOriginateRefusesTimeoutOverrides(t *testing.T) {
 		"context control":              {"aleg": aleg, "context": "acme\x00"},
 		"caller_id_number space":       {"aleg": aleg, "caller_id_number": "514 555"},
 		"caller_id_number comma":       {"aleg": aleg, "caller_id_number": "1,originate_timeout=300"},
-		"caller_id_name quote":         {"aleg": aleg, "caller_id_name": "x' undef 300 '"},
-		"caller_id_name comma":         {"aleg": aleg, "caller_id_name": "x,originate_timeout=300"},
+		"caller_id_name brace":         {"aleg": aleg, "caller_id_name": "x}user/666"},
 		"value injects a key":          {"aleg": aleg, "channel_variables": map[string]any{"foo": "1,originate_timeout=300"}},
 		"value with space":             {"aleg": aleg, "channel_variables": map[string]any{"foo": "a b"}},
 		"key with =":                   {"aleg": aleg, "channel_variables": map[string]any{"originate_timeout=300,foo": "1"}},
@@ -528,6 +492,47 @@ func TestOriginateAcceptsOrdinaryInput(t *testing.T) {
 			}
 			if args := fsOriginateArgs(t, strings.TrimPrefix(fs.commands()[1], "1:api ")); len(args) != 7 || args[6] != "60" || !strings.HasPrefix(args[0], "{originate_timeout=60") {
 				t.Fatalf("FreeSWITCH would see %d args %q", len(args), args)
+			}
+		})
+	}
+}
+
+// Caller ID names with apostrophes, commas, backslashes and spaces are escaped,
+// not refused: FreeSWITCH (the port of its splitters in fsparse_test.go) reads
+// back exactly the name, sets no other variable, and still sees seven
+// arguments with the ring timeout last.
+func TestOriginateCallerIDNameRoundTrip(t *testing.T) {
+	names := []string{
+		"O'Brien", "Smith, John", "D'Arcy O'Neil", "it's, ok", `back\slash`, `a\sb`, `\n`, `\'`,
+		"x' undef 300 '", "x,originate_timeout=300", "x\\,originate_timeout=300", "a,,b", "''", "'", ",",
+		"Front Desk", "  padded  ", "Zoë Ångström", `say "hi"`, "x=y", "^^:x", "$var", "100%",
+	}
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			fs := newFakeFreeSWITCH(t, "ClueCon-test", replyWith("+OK "+fxCallX+"\n"))
+			h, _ := originateHandlerFor(fs)
+			rec := originate(t, h, fxUser1, fxDomainA, map[string]any{
+				"aleg": "user/101@acme.example.com", "caller_id_name": name, "caller_id_number": "5145550100", "timeout_sec": 20,
+			})
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body)
+			}
+			got := fsParseOriginate(t, strings.TrimPrefix(fs.commands()[1], "1:api "))
+			if len(got.args) != 7 || got.args[6] != "20" || got.leg != "user/101@acme.example.com" {
+				t.Fatalf("FreeSWITCH would see %d args %q (leg %q)", len(got.args), got.args, got.leg)
+			}
+			want := map[string]string{
+				"originate_timeout":            "20",
+				"origination_caller_id_number": "5145550100",
+				"origination_caller_id_name":   strings.TrimSpace(name),
+			}
+			if len(got.vars) != len(want) {
+				t.Fatalf("variables %q, want %q", got.vars, want)
+			}
+			for k, v := range want {
+				if got.vars[k] != v {
+					t.Fatalf("%s = %q, want %q (all: %q)", k, got.vars[k], v, got.vars)
+				}
 			}
 		})
 	}

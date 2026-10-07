@@ -106,8 +106,10 @@ func validateOriginateInput(req *OriginateRequest) ([]string, error) {
 			return nil, fmt.Errorf("%s may not contain spaces, quotes, backslashes, commas or brackets", name)
 		}
 	}
-	if hasControl(req.CallerIDName) || strings.ContainsAny(req.CallerIDName, inlineVarChars+retokenizeChars+varListSeparator) {
-		return nil, fmt.Errorf("caller_id_name may not contain quotes, backslashes, commas or brackets")
+	// Apostrophes, commas and backslashes in a caller ID name are escaped
+	// (fsVarValueArg), not refused; brackets would still unbalance the {..} list.
+	if hasControl(req.CallerIDName) || strings.ContainsAny(req.CallerIDName, inlineVarChars) {
+		return nil, fmt.Errorf("caller_id_name may not contain brackets or control characters")
 	}
 
 	vars := make([]string, 0, len(req.ChannelVariables))
@@ -169,4 +171,39 @@ func checkALegTiming(aleg string) error {
 		}
 	}
 	return nil
+}
+
+// fsVarValueArg encodes v as the value of a {..} variable inside an
+// `api originate` argument, so FreeSWITCH reads back exactly v (leading and
+// trailing spaces trimmed, as FreeSWITCH would). The value passes three
+// splitters (switch_utils.c), each of which unescapes once, so it is escaped
+// three times, innermost first:
+//   - the variable's "key=value" split on '=' (pairs of apostrophes would
+//     otherwise be read as quotes): \ and \';
+//   - the {..} list split on ',': \ \' and \,;
+//   - the command split on ' ' (originate_function): \ \' and a space as \s.
+func fsVarValueArg(v string) string {
+	v = strings.TrimSpace(v)
+	v = fsEscape(v, `\'`, false)
+	v = fsEscape(v, `\',`, false)
+	return fsEscape(v, `\'`, true)
+}
+
+// fsEscape puts a backslash before every byte of special, and writes spaces
+// as \s when spaces is set.
+func fsEscape(s, special string, spaces bool) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case spaces && c == ' ':
+			b.WriteString(`\s`)
+		case strings.IndexByte(special, c) >= 0:
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }

@@ -556,8 +556,8 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 		vars = append(vars, fmt.Sprintf("origination_caller_id_number=%s", req.CallerIDNumber))
 	}
 	if req.CallerIDName != "" {
-		// Quote caller ID name in case it contains spaces
-		vars = append(vars, fmt.Sprintf("origination_caller_id_name='%s'", req.CallerIDName))
+		// Escaped so spaces, apostrophes and commas reach FreeSWITCH as written
+		vars = append(vars, "origination_caller_id_name="+fsVarValueArg(req.CallerIDName))
 	}
 
 	// The ring timeout also goes in as originate_timeout, first in the {..}

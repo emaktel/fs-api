@@ -427,7 +427,11 @@ components:
           description: No spaces, control characters, quotes, backslashes, commas or brackets.
         caller_id_name:
           type: string
-          description: Spaces allowed; no quotes, backslashes, commas, brackets or control characters.
+          description: >
+            Any text without brackets (`{ } [ ] < >`) or control characters.
+            Spaces, apostrophes, commas and backslashes are escaped so
+            FreeSWITCH receives the name exactly (leading and trailing spaces
+            are trimmed).
         caller_id_number:
           type: string
           description: No spaces, control characters, quotes, backslashes, commas or brackets.
