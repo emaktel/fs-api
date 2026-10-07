@@ -372,6 +372,150 @@ func TestOriginateCommandArguments(t *testing.T) {
 			if len(cmds) != 2 || cmds[1] != "1:api "+tc.want {
 				t.Fatalf("command\n got: %q\nwant: %q", cmds, "1:api "+tc.want)
 			}
+			// FreeSWITCH sees exactly seven arguments, the ring timeout last.
+			args := fsOriginateArgs(t, tc.want)
+			if fields := strings.Fields(tc.want); len(args) != 7 || args[6] != fields[len(fields)-1] {
+				t.Fatalf("FreeSWITCH would see %d args %q", len(args), args)
+			}
+		})
+	}
+}
+
+// fsOriginateArgs splits an `api originate` argument string the way
+// FreeSWITCH does (switch_utils.c separate_string_blank_delim +
+// cleanup_separated_string: spaces separate, single quotes group and are
+// stripped; this test only ever sees inputs without backslashes or "^^").
+func fsOriginateArgs(t *testing.T, cmd string) []string {
+	t.Helper()
+	rest, ok := strings.CutPrefix(cmd, "originate ")
+	if !ok {
+		t.Fatalf("not an originate: %q", cmd)
+	}
+	var args []string
+	var cur strings.Builder
+	inQuotes, inToken := false, false
+	for _, r := range rest {
+		switch {
+		case r == '\'':
+			inQuotes = !inQuotes
+			inToken = true
+		case r == ' ' && !inQuotes:
+			if inToken {
+				args = append(args, cur.String())
+				cur.Reset()
+				inToken = false
+			}
+		default:
+			cur.WriteRune(r)
+			inToken = true
+		}
+	}
+	if inToken {
+		args = append(args, cur.String())
+	}
+	return args
+}
+
+// The Chrome extension's real request: its &transfer(dest XML domain) B-leg
+// has spaces, so it is sent single-quoted as one argument, and FreeSWITCH sees
+// exactly seven arguments with the requested ring timeout last. (Unquoted, the
+// fixed seven-slot command would have been ten arguments: -USAGE.)
+func TestOriginateChromeExtensionRequest(t *testing.T) {
+	fs := newFakeFreeSWITCH(t, "ClueCon-test", replyWith("+OK "+fxCallX+"\n"))
+	h, es := originateHandlerFor(fs)
+	rec := originate(t, h, fxUser1, fxDomainA, map[string]any{
+		"aleg":             "user/101@acme.example.com",
+		"bleg":             "&transfer(5145550199 XML acme.example.com)",
+		"caller_id_name":   "5145550199",
+		"caller_id_number": "5145550199",
+		"timeout_sec":      30,
+	})
+	if rec.Code != http.StatusOK || registeredCalls(es)[fxCallX] == nil {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	want := "originate {origination_caller_id_number=5145550199,origination_caller_id_name='5145550199'}user/101@acme.example.com '&transfer(5145550199 XML acme.example.com)' undef undef undef undef 30"
+	cmd := strings.TrimPrefix(fs.commands()[1], "1:api ")
+	if cmd != want {
+		t.Fatalf("command\n got: %q\nwant: %q", cmd, want)
+	}
+	args := fsOriginateArgs(t, cmd)
+	if len(args) != 7 || args[1] != "&transfer(5145550199 XML acme.example.com)" || args[6] != "30" {
+		t.Fatalf("FreeSWITCH would see %d args %q", len(args), args)
+	}
+}
+
+// Every route around the ring timeout is refused with 400 before anything is
+// dialed: inline variables in aleg/bleg, argument-shifting characters, and
+// channel variables that change originate timing (any case).
+func TestOriginateRefusesTimeoutOverrides(t *testing.T) {
+	const aleg = "user/101@acme.example.com"
+	cases := map[string]map[string]any{
+		"aleg {originate_timeout}": {"aleg": "{originate_timeout=300}" + aleg},
+		"aleg [leg_timeout]":       {"aleg": "[leg_timeout=300]" + aleg},
+		"aleg <leg_timeout>":       {"aleg": "<leg_timeout=300>" + aleg},
+		"aleg space":               {"aleg": aleg + " 300"},
+		"aleg tab":                 {"aleg": aleg + "\t300"},
+		"aleg newline":             {"aleg": aleg + "\n"},
+		"aleg quote":               {"aleg": aleg + "'"},
+		"aleg backslash":           {"aleg": aleg + `\ 300`},
+		"aleg delimiter switch":    {"aleg": "^^:" + aleg},
+		"bleg {originate_timeout}": {"aleg": aleg, "bleg": "{originate_timeout=300}&park()"},
+		"bleg [leg_timeout]":       {"aleg": aleg, "bleg": "[leg_timeout=300]1001"},
+		"bleg space, not an app":   {"aleg": aleg, "bleg": "1001 XML ctx undef undef 300"},
+		"bleg app plus extra args": {"aleg": aleg, "bleg": "&park() undef undef undef undef 300"},
+		"bleg quote":               {"aleg": aleg, "bleg": "&transfer('1001 XML ctx')"},
+		"bleg control":             {"aleg": aleg, "bleg": "&park()\r"},
+		"dialplan space":           {"aleg": aleg, "dialplan": "XML 300"},
+		"context space":            {"aleg": aleg, "context": "acme undef undef 300"},
+		"context control":          {"aleg": aleg, "context": "acme\x00"},
+		"caller_id_number space":   {"aleg": aleg, "caller_id_number": "514 555"},
+		"caller_id_number comma":   {"aleg": aleg, "caller_id_number": "1,originate_timeout=300"},
+		"caller_id_name quote":     {"aleg": aleg, "caller_id_name": "x' undef 300 '"},
+		"caller_id_name comma":     {"aleg": aleg, "caller_id_name": "x,originate_timeout=300"},
+		"value injects a key":      {"aleg": aleg, "channel_variables": map[string]any{"foo": "1,originate_timeout=300"}},
+		"value with space":         {"aleg": aleg, "channel_variables": map[string]any{"foo": "a b"}},
+		"key with =":               {"aleg": aleg, "channel_variables": map[string]any{"originate_timeout=300,foo": "1"}},
+		"value is an object":       {"aleg": aleg, "channel_variables": map[string]any{"foo": map[string]any{"a": 1}}},
+	}
+	for v := range originateTimingVars {
+		cases["timing var "+v] = map[string]any{"aleg": aleg, "channel_variables": map[string]any{v: 300}}
+		cases["timing var "+strings.ToUpper(v)] = map[string]any{"aleg": aleg, "channel_variables": map[string]any{strings.ToUpper(v): 300}}
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			fs := newFakeFreeSWITCH(t, "ClueCon-test", replyWith("+OK "+fxCallX+"\n"))
+			h, es := originateHandlerFor(fs)
+			rec := originate(t, h, fxUser1, fxDomainA, body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body)
+			}
+			if fs.acceptCount() != 0 || len(registeredCalls(es)) != 0 || len(h.originateSlots) != 0 {
+				t.Fatalf("refused request reached FreeSWITCH (%d dials), registered or held a slot", fs.acceptCount())
+			}
+		})
+	}
+}
+
+// Ordinary values stay accepted: forked and gateway dial strings, &app with
+// and without arguments, a spaced caller ID name, plain channel variables.
+func TestOriginateAcceptsOrdinaryInput(t *testing.T) {
+	for name, body := range map[string]map[string]any{
+		"forked aleg":       {"aleg": "user/101@acme.example.com,user/102@acme.example.com"},
+		"gateway aleg":      {"aleg": "sofia/gateway/carrier/+15145550199"},
+		"plain bleg":        {"aleg": "user/101@acme.example.com", "bleg": "5145550199"},
+		"app without args":  {"aleg": "user/101@acme.example.com", "bleg": "&echo"},
+		"spaced cid name":   {"aleg": "user/101@acme.example.com", "caller_id_name": "Front Desk"},
+		"channel variables": {"aleg": "user/101@acme.example.com", "channel_variables": map[string]any{"sip_h_X-Ticket": "T-42", "ignore_early_media": true, "hold_music": "local_stream://moh"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fs := newFakeFreeSWITCH(t, "ClueCon-test", replyWith("+OK "+fxCallX+"\n"))
+			h, _ := originateHandlerFor(fs)
+			if rec := originate(t, h, fxUser1, fxDomainA, body); rec.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body)
+			}
+			if args := fsOriginateArgs(t, strings.TrimPrefix(fs.commands()[1], "1:api ")); len(args) != 7 || args[6] != "60" {
+				t.Fatalf("FreeSWITCH would see %d args %q", len(args), args)
+			}
 		})
 	}
 }

@@ -537,32 +537,18 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, r, fmt.Sprintf("timeout_sec must be at most %d", maxOriginateTimeoutSec), http.StatusBadRequest)
 		return
 	}
-	if _, set := req.ChannelVariables["originate_timeout"]; set {
-		h.respondError(w, r, "channel_variables.originate_timeout is not accepted; use timeout_sec", http.StatusBadRequest)
-		return
-	}
 
 	// If bleg is not provided, default to park
 	if req.BLeg == "" {
 		req.BLeg = "&park()"
 	}
 
-	// Build channel variables string
-	// Start with user-provided channel variables
-	vars := []string{}
-	if len(req.ChannelVariables) > 0 {
-		for key, value := range req.ChannelVariables {
-			switch v := value.(type) {
-			case string:
-				vars = append(vars, fmt.Sprintf("%s=%s", key, v))
-			case bool:
-				vars = append(vars, fmt.Sprintf("%s=%t", key, v))
-			case float64:
-				vars = append(vars, fmt.Sprintf("%s=%v", key, v))
-			default:
-				vars = append(vars, fmt.Sprintf("%s=%v", key, v))
-			}
-		}
+	// Nothing in the request may move the ring timeout or the arguments that
+	// carry it (originate_input.go).
+	vars, err := validateOriginateInput(&req)
+	if err != nil {
+		h.respondError(w, r, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	// Add caller ID as channel variables (these take precedence)
@@ -590,7 +576,7 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 	ringTimeoutSec := originateTimeoutSec(req.TimeoutSec)
 	var cmd strings.Builder
 	fmt.Fprintf(&cmd, "originate %s%s %s %s %s undef undef %d",
-		channelVars, req.ALeg, req.BLeg, orUndef(req.Dialplan), orUndef(req.Context), ringTimeoutSec)
+		channelVars, req.ALeg, originateBLegArg(req.BLeg), orUndef(req.Dialplan), orUndef(req.Context), ringTimeoutSec)
 
 	// Send the originate on its own ESL connection. The shared connection does
 	// not match replies to requests, so a uuid read from its reply could be

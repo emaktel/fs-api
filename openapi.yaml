@@ -407,18 +407,27 @@ components:
       properties:
         aleg:
           type: string
-          description: A-leg endpoint
+          description: >
+            A-leg dial string. No spaces, control characters, quotes,
+            backslashes or inline variables (`{ } [ ] < >`); refused with 400.
         bleg:
           type: string
-          description: "B-leg destination (default: &park())"
+          description: >
+            B-leg destination (default `&park()`). Spaces are allowed only in
+            an application, `&app(args)`; no quotes, backslashes, control
+            characters or inline variables (`{ } [ ] < >`).
         dialplan:
           type: string
+          description: No spaces, control characters, quotes, backslashes, commas or brackets.
         context:
           type: string
+          description: No spaces, control characters, quotes, backslashes, commas or brackets.
         caller_id_name:
           type: string
+          description: Spaces allowed; no quotes, backslashes, commas, brackets or control characters.
         caller_id_number:
           type: string
+          description: No spaces, control characters, quotes, backslashes, commas or brackets.
         timeout_sec:
           type: integer
           maximum: 85
@@ -431,8 +440,15 @@ components:
           type: object
           additionalProperties: true
           description: >
-            Additional FreeSWITCH channel variables. `originate_timeout` is
-            refused (400); use `timeout_sec`.
+            Additional FreeSWITCH channel variables. Variables that change
+            originate timing or retries are refused (400, any case):
+            `originate_timeout`, `leg_timeout`, `leg_progress_timeout`,
+            `progress_timeout`, `originate_retries`, `originate_retry_sleep_ms`,
+            `originate_retry_min_period_ms`, `originate_retry_timeout`,
+            `originate_continue_on_timeout`, `originate_delay_start`,
+            `leg_delay_start` and `group_confirm_*`; use `timeout_sec`. Keys and
+            values may not contain spaces, quotes, backslashes, commas or
+            brackets.
 
     AgentAddRequest:
       type: object
@@ -1062,9 +1078,11 @@ paths:
                 $ref: "#/components/schemas/OriginateResponse"
         "400":
           description: >
-            Invalid request: missing `aleg`, `timeout_sec` above 85,
-            `originate_timeout` in `channel_variables`, or FreeSWITCH rejected
-            the originate arguments (`-USAGE`; message
+            Invalid request: missing `aleg`, `timeout_sec` above 85, a field
+            that could set inline variables or shift the originate arguments
+            (see `aleg`, `bleg`, `dialplan`, `context`, caller ID), a timing
+            variable in `channel_variables`, or FreeSWITCH rejected the
+            originate arguments (`-USAGE`; message
             `Invalid originate arguments: -USAGE: …`).
           headers:
             X-Request-ID:
