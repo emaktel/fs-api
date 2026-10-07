@@ -25,9 +25,14 @@ import (
 //   - channel_variables may not set originate timing, and their keys and
 //     values may not contain the separators FreeSWITCH parses inside {..}.
 
-// originateTimingVars are the channel variables switch_ivr_originate.c
-// (FreeSWITCH 1.10.12) reads that change how long an originate rings, waits
-// or retries. Compared case-insensitively.
+// originateTimingVars are the channel variables FreeSWITCH 1.10.12 reads that
+// change how long an originate rings, waits or retries
+// (switch_ivr_originate.c), or that stop fs-api's originate_timeout reaching
+// the dialled leg: user_recurse_variables / group_recurse_variables false make
+// the user/ and group/ endpoints drop the inherited variables, so their inner
+// originate rings for its 60 s default (mod_dptools user_outgoing_channel,
+// group_outgoing_channel); origination_nested_vars changes how the {..} list
+// is parsed. Compared case-insensitively.
 var originateTimingVars = map[string]bool{
 	"originate_timeout":             true,
 	"call_timeout":                  true, // SWITCH_CALL_TIMEOUT_VARIABLE, read by the user/ group/ lcr/ endpoints
@@ -46,7 +51,15 @@ var originateTimingVars = map[string]bool{
 	"group_confirm_timeout":         true,
 	"group_confirm_read_timeout":    true,
 	"group_confirm_cancel_timeout":  true,
+	"user_recurse_variables":        true,
+	"group_recurse_variables":       true,
+	"origination_nested_vars":       true,
 }
+
+// nestedVarsMarker: switch_ivr_originate.c switches its {..} parsing when the
+// dial string merely contains "origination_nested_vars=true" (switch_stristr),
+// so the text is refused anywhere it would land in the dial string.
+const nestedVarsMarker = "origination_nested_vars"
 
 const (
 	inlineVarChars   = "{}[]<>"
@@ -77,6 +90,11 @@ func validateOriginateInput(req *OriginateRequest) ([]string, error) {
 	if err := checkALegTiming(req.ALeg); err != nil {
 		return nil, err
 	}
+	for name, v := range map[string]string{"aleg": req.ALeg, "caller_id_name": req.CallerIDName, "caller_id_number": req.CallerIDNumber} {
+		if strings.Contains(strings.ToLower(v), nestedVarsMarker) {
+			return nil, fmt.Errorf("%s may not contain %s", name, nestedVarsMarker)
+		}
+	}
 	if hasControl(req.BLeg) || strings.ContainsAny(req.BLeg, inlineVarChars+retokenizeChars) {
 		return nil, fmt.Errorf("bleg may not contain quotes, backslashes, control characters or inline variables ({ } [ ] < >)")
 	}
@@ -98,7 +116,10 @@ func validateOriginateInput(req *OriginateRequest) ([]string, error) {
 			return nil, fmt.Errorf("channel_variables.%s is not accepted: the ring time is set by timeout_sec", key)
 		}
 		val := fmt.Sprintf("%v", value)
-		if key == "" || hasSpaceOrControl(key) || strings.ContainsAny(key, inlineVarChars+retokenizeChars+varListSeparator+"=") {
+		if strings.Contains(strings.ToLower(val), nestedVarsMarker) {
+			return nil, fmt.Errorf("channel_variables.%s may not contain %s", key, nestedVarsMarker)
+		}
+		if key == "" || hasSpaceOrControl(key) || strings.ContainsAny(key, inlineVarChars+retokenizeChars+varListSeparator+"=^") {
 			return nil, fmt.Errorf("channel_variables has an invalid key %q", key)
 		}
 		if hasSpaceOrControl(val) || strings.ContainsAny(val, inlineVarChars+retokenizeChars+varListSeparator) {

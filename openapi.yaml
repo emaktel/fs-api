@@ -449,7 +449,10 @@ components:
             `progress_timeout`, `originate_retries`, `originate_retry_sleep_ms`,
             `originate_retry_min_period_ms`, `originate_retry_timeout`,
             `originate_continue_on_timeout`, `originate_delay_start`,
-            `leg_delay_start` and `group_confirm_*`; use `timeout_sec`. Keys and
+            `leg_delay_start` and `group_confirm_*`; use `timeout_sec`. Also
+            refused: `user_recurse_variables`, `group_recurse_variables` and
+            `origination_nested_vars` (they stop the ring timeout reaching the
+            dialled leg), and the text `origination_nested_vars` in any value. Keys and
             values may not contain spaces, quotes, backslashes, commas or
             brackets.
 
