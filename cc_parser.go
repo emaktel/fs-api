@@ -74,9 +74,22 @@ func ParsePlainCount(raw string) (int, error) {
 // agent contact field. The contact field contains key=value pairs and we look
 // for "domain_name=<value>". Returns empty string if not found.
 func ExtractDomainFromContact(contact string) string {
-	// Look for domain_name= in the contact string
+	// Look for the domain_name= variable: the whole key, at the start of the
+	// {...} list or after a comma (not another key ending in domain_name).
 	const prefix = "domain_name="
-	idx := strings.Index(contact, prefix)
+	idx := -1
+	for from := 0; from < len(contact); {
+		i := strings.Index(contact[from:], prefix)
+		if i == -1 {
+			break
+		}
+		i += from
+		if i == 0 || contact[i-1] == '{' || contact[i-1] == ',' {
+			idx = i
+			break
+		}
+		from = i + len(prefix)
+	}
 	if idx == -1 {
 		return ""
 	}

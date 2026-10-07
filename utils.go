@@ -4,10 +4,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
-	"strings"
-
-	"github.com/google/uuid"
 )
 
 // Configuration with sane defaults
@@ -18,32 +14,13 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-// UUID Validation
+// validateUUID accepts only the canonical lowercase form FreeSWITCH gives
+// call uuids, so a call id can't carry braces, a urn: prefix or spaces into a
+// command.
 func validateUUID(uuidStr string) error {
-	if _, err := uuid.Parse(uuidStr); err != nil {
-		return fmt.Errorf("invalid UUID format: %s", uuidStr)
+	if !canonicalUUID.MatchString(uuidStr) {
+		return fmt.Errorf("invalid UUID format: %q", uuidStr)
 	}
-	return nil
-}
-
-// Path Validation for recording filenames
-func validateFilePath(path string) error {
-	if path == "" {
-		return fmt.Errorf("path cannot be empty")
-	}
-
-	cleanPath := filepath.Clean(path)
-
-	// Must be absolute path
-	if !filepath.IsAbs(cleanPath) {
-		return fmt.Errorf("path must be absolute")
-	}
-
-	// Check for path traversal attempts
-	if strings.Contains(path, "..") {
-		return fmt.Errorf("path traversal not allowed")
-	}
-
 	return nil
 }
 

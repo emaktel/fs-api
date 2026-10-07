@@ -441,3 +441,35 @@ func TestESLSerialNoRetryAfterPartialReply(t *testing.T) {
 		t.Fatalf("dials = %d, want 1 (no retry after reply bytes)", n)
 	}
 }
+
+// API runs a call-center command on the serialized connection, returns its
+// reply, and turns mod_callcenter's "-ERR" reply into an error.
+func TestESLSerialAPI(t *testing.T) {
+	const row = "name|instance_id|uuid|type|contact|status\n" + fxCallX + "|single_box||callback|user/101@acme.example.com|Available\n+OK\n"
+	fs := newFakeFreeSWITCH(t, "ClueCon-test", func(_ int, cmd string, conn net.Conn) bool {
+		if strings.HasSuffix(cmd, fxCallY) {
+			io.WriteString(conn, apiResponseFrame("-ERR Invalid Agent!\n"))
+			return false
+		}
+		io.WriteString(conn, apiResponseFrame(row))
+		return false
+	})
+	c := newSerialClientFor(fs)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	got, err := c.API(ctx, "callcenter_config agent list "+fxCallX)
+	if err != nil || got != row {
+		t.Fatalf("API = %q, %v", got, err)
+	}
+	if _, err := c.API(ctx, "callcenter_config agent list "+fxCallY); err == nil {
+		t.Fatalf("an -ERR reply must be an error")
+	}
+	want := []string{"1:auth ClueCon-test", "1:api callcenter_config agent list " + fxCallX, "1:api callcenter_config agent list " + fxCallY}
+	if got := fs.commands(); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("commands %q", got)
+	}
+	if _, err := c.API(context.Background(), "callcenter_config agent list "+fxCallX); err == nil {
+		t.Fatalf("API without a deadline must refuse")
+	}
+}

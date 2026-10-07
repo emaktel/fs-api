@@ -50,7 +50,7 @@ type OriginateRequest struct {
 	CallerIDNumber   string                 `json:"caller_id_number,omitempty"`
 	TimeoutSec       int                    `json:"timeout_sec,omitempty"`
 	ChannelVariables map[string]interface{} `json:"channel_variables,omitempty"`
-	CallbackURL      string                 `json:"callback_url,omitempty"`
+	CallbackURL      string                 `json:"callback_url,omitempty"` // refused (originate_input.go)
 }
 
 // ConferenceRequest is the body for POST /v1/calls/{uuid}/conference — the destination

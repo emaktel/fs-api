@@ -320,12 +320,18 @@ components:
 
     # -- Request bodies ----------------------------------------------------
 
+    # Every value below is matched against its shape and anything else is
+    # refused with 400 before a FreeSWITCH command is built (input_allowlist.go,
+    # originate_input.go). Names, contexts and contacts in another tenant than
+    # X-Allowed-Contexts allows answer 403.
+
     HangupRequest:
       type: object
       properties:
         cause:
           type: string
-          description: "SIP hangup cause (default: NORMAL_CLEARING)"
+          pattern: "^(?:[A-Z][A-Z_]{0,63}|[0-9]{1,3})$"
+          description: "Hangup cause name or Q.850 code (default: NORMAL_CLEARING)"
           example: NORMAL_CLEARING
 
     TransferRequest:
@@ -334,17 +340,19 @@ components:
       properties:
         destination:
           type: string
-          description: Destination extension or number
+          pattern: "^[A-Za-z0-9*#+][A-Za-z0-9*#+_.-]{0,63}$"
+          description: Dialplan extension, number or feature code
         leg:
           type: string
           enum: [aleg, bleg, both]
           default: aleg
         dialplan:
           type: string
-          description: "Dialplan type (defaults to XML when context is set)"
+          enum: [XML]
+          description: "Only with context (defaults to XML when context is set)"
         context:
           type: string
-          description: Dialplan context
+          description: A domain name in X-Allowed-Contexts (403 otherwise)
 
     ConferenceRequest:
       type: object
@@ -352,13 +360,16 @@ components:
       properties:
         destination:
           type: string
+          pattern: "^[0-9+*#]{1,20}$"
           description: Extension or external number to add to the call's conference room
         tollAllow:
           type: string
+          pattern: "^[A-Za-z0-9_-]{1,32}(?:,[A-Za-z0-9_-]{1,32}){0,31}$"
           description: >
-            The originating extension's toll/dial permission (comma-separated classes), set by
-            the caller so the loopback dial is gated by the same dialplan toll rules a normal
-            outbound call gets. Empty for internal-extension adds.
+            The originating extension's toll classes, read server-side by the caller (the
+            SvelteKit softphone reads them from the user's own extension; the public calls_v2
+            proxy never forwards one), so the loopback dial is gated by the same dialplan toll
+            rules a normal outbound call gets. Empty for internal-extension adds.
 
     BridgeRequest:
       type: object
@@ -367,9 +378,11 @@ components:
         uuid_a:
           type: string
           format: uuid
+          description: Canonical lowercase uuid
         uuid_b:
           type: string
           format: uuid
+          description: Canonical lowercase uuid
 
     HoldRequest:
       type: object
@@ -388,7 +401,10 @@ components:
           enum: [start, stop]
         filename:
           type: string
-          description: Absolute file path (required for start)
+          description: >
+            Required for start: a .wav or .mp3 file under
+            /var/lib/freeswitch/recordings/<the call's domain>/, path segments of letters,
+            digits, `_`, `-` and `.` (no `..`).
 
     DTMFRequest:
       type: object
@@ -396,9 +412,11 @@ components:
       properties:
         digits:
           type: string
-          description: DTMF digit sequence
+          pattern: "^[0-9A-Da-d*#wW]{1,64}$"
         duration:
           type: integer
+          minimum: 40
+          maximum: 2000
           description: "Tone duration in ms (default: 100)"
 
     OriginateRequest:
@@ -408,33 +426,27 @@ components:
         aleg:
           type: string
           description: >
-            A-leg dial string. No spaces, control characters, quotes,
-            backslashes or inline variables (`{ } [ ] < >`), and nothing that
-            rings legs one after another: `|` (serial failover), `$`
-            (variable expansion), or the `group/` and `lcr/` endpoints.
-            Parallel `,` and enterprise `:_:` are allowed. Refused with 400.
+            One `user/<extension>@<domain>`, the domain in X-Allowed-Contexts (403 otherwise).
         bleg:
           type: string
           description: >
-            B-leg destination (default `&park()`). Spaces are allowed only in
-            an application, `&app(args)`; no quotes, backslashes, control
-            characters or inline variables (`{ } [ ] < >`).
+            `&park()` (the default), or a dialplan extension, number or feature code the
+            answered A-leg is sent to in `context` (required then).
         dialplan:
           type: string
-          description: No spaces, control characters, quotes, backslashes, commas or brackets.
+          enum: [XML]
         context:
           type: string
-          description: No spaces, control characters, quotes, backslashes, commas or brackets.
+          description: A domain name in X-Allowed-Contexts (403 otherwise).
         caller_id_name:
           type: string
           description: >
-            Any text without brackets (`{ } [ ] < >`) or control characters.
-            Spaces, apostrophes, commas and backslashes are escaped so
-            FreeSWITCH receives the name exactly (leading and trailing spaces
-            are trimmed).
+            Letters, digits, spaces and `. , ' _ ( ) # + -`, at most 64 characters.
+            Spaces, apostrophes and commas are escaped so FreeSWITCH receives the
+            name exactly (leading and trailing spaces are trimmed).
         caller_id_number:
           type: string
-          description: No spaces, control characters, quotes, backslashes, commas or brackets.
+          pattern: "^\\+?[0-9]{1,20}$"
         timeout_sec:
           type: integer
           maximum: 85
@@ -445,20 +457,15 @@ components:
             the request is refused with 400.
         channel_variables:
           type: object
-          additionalProperties: true
-          description: >
-            Additional FreeSWITCH channel variables. Variables that change
-            originate timing or retries are refused (400, any case):
-            `originate_timeout`, `call_timeout`, `leg_timeout`, `leg_progress_timeout`,
-            `progress_timeout`, `originate_retries`, `originate_retry_sleep_ms`,
-            `originate_retry_min_period_ms`, `originate_retry_timeout`,
-            `originate_continue_on_timeout`, `originate_delay_start`,
-            `leg_delay_start` and `group_confirm_*`; use `timeout_sec`. Also
-            refused: `user_recurse_variables`, `group_recurse_variables` and
-            `origination_nested_vars` (they stop the ring timeout reaching the
-            dialled leg), and the text `origination_nested_vars` in any value. Keys and
-            values may not contain spaces, quotes, backslashes, commas or
-            brackets.
+          description: Only `origination_uuid`, a canonical lowercase uuid.
+          properties:
+            origination_uuid:
+              type: string
+              format: uuid
+          additionalProperties: false
+        callback_url:
+          type: string
+          description: Not accepted (400).
 
     AgentAddRequest:
       type: object
@@ -466,17 +473,24 @@ components:
       properties:
         name:
           type: string
-          description: Agent identifier (UUID)
+          description: >
+            The FusionPBX agent uuid, or `<name>@<domain>` with the domain in
+            X-Allowed-Contexts. A uuid-named agent added by a restricted caller (exactly one
+            allowed context, 400 otherwise) belongs to that tenant until its contact is set
+            (remembered per box, in memory, for 10 minutes): only that tenant may change it or
+            give it a contact, in that tenant.
         type:
           type: string
           enum: [callback, uuid-standby]
-        domain:
-          type: string
-          description: Domain for authorization validation
 
     AgentSetRequest:
       type: object
       required: [key, value]
+      description: >
+        The agent must belong to one of X-Allowed-Contexts (its contact's domain_name, its
+        user/<ext>@<domain> contact, or its <name>@<domain> name): 403 otherwise, 404 when
+        it isn't loaded. An agent with no tenant yet can only be given a contact in one of
+        X-Allowed-Contexts.
       properties:
         key:
           type: string
@@ -489,19 +503,15 @@ components:
             - wrap_up_time
             - reject_delay_time
             - busy_delay_time
+            - no_answer_delay_time
             - ready_time
         value:
           type: string
-        domain:
-          type: string
-          description: Domain for authorization validation
-
-    AgentDelRequest:
-      type: object
-      properties:
-        domain:
-          type: string
-          description: Domain for authorization validation
+          description: >
+            status: Available, Available (On Demand), On Break or Logged Out. state: Idle,
+            Waiting, Receiving, In a queue call or Reserved. type: callback or uuid-standby.
+            contact: user/<extension>@<domain>, the domain in X-Allowed-Contexts. ready_time:
+            epoch seconds. The other keys: a whole number (at most 6 digits).
 
     TierAddRequest:
       type: object
@@ -509,14 +519,17 @@ components:
       properties:
         queue:
           type: string
-          description: "Queue name in `name@domain` format"
+          description: "Queue name `<name>@<domain>`, the domain in X-Allowed-Contexts"
         agent:
           type: string
-          description: Agent identifier (UUID)
+          description: An agent of one of X-Allowed-Contexts (uuid or `<name>@<domain>`)
         level:
           type: string
+          pattern: "^[0-9]{1,6}$"
         position:
           type: string
+          pattern: "^[0-9]{1,6}$"
+          description: Only with level
 
     TierDelRequest:
       type: object
@@ -540,6 +553,7 @@ components:
           enum: [state, level, position]
         value:
           type: string
+          description: "state: Ready, Standby, Offering, Active Inbound or No Answer. level, position: a whole number."
 
   # -------------------------------------------------------------------------
   # Reusable responses
@@ -836,11 +850,12 @@ paths:
       tags: [Calls]
       summary: Add a participant to the call as a server-mixed conference ("add people")
       description: >
-        On the first add, moves the call and its bridged partner into a per-call room on the
-        stock `default` conference profile (one `uuid_transfer -both`), then dials `destination`
-        into it via a loopback through the call's own dialplan context; subsequent adds reuse the
-        room. Uses the stock `default` profile, so no special conference config is required; the
-        join is verified and a 503 is returned if that profile is unavailable. The dial is
+        On the first add, moves the call and its bridged partner (read from the call's own
+        channel dump; it must be the same tenant, 403 otherwise, 409 if it has hung up) into a
+        per-call room `sp-<uuid>` on the `softphone` conference profile, one `uuid_transfer` per
+        leg, then dials `destination` into it via a loopback through the call's own dialplan
+        context; later adds reuse the room. A call in any other conference answers 409. The join
+        is verified and a 503 is returned if the profile is unavailable. The dial is
         non-blocking — a 200 means the participant was queued, not yet connected.
       operationId: addToConference
       parameters:
@@ -868,6 +883,12 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: The bridged partner has hung up, or the call is in a conference fs-api didn't start
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorMessage"
         "502":
           $ref: "#/components/responses/BadGateway"
         "503":
@@ -1511,14 +1532,12 @@ paths:
       tags: [Callcenter - Agents]
       summary: Delete an agent
       operationId: ccDeleteAgent
+      description: >
+        The agent must belong to one of X-Allowed-Contexts (403 otherwise, 404 when it isn't
+        loaded). A request body is ignored.
       parameters:
         - $ref: "#/components/parameters/AgentName"
         - $ref: "#/components/parameters/XAllowedContexts"
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/AgentDelRequest"
       responses:
         "200":
           description: Agent deleted

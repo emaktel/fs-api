@@ -382,34 +382,6 @@ func TestOriginateCommandArguments(t *testing.T) {
 	}
 }
 
-// The Chrome extension's real request: its &transfer(dest XML domain) B-leg
-// has spaces, so it is sent single-quoted as one argument, and FreeSWITCH sees
-// exactly seven arguments with the requested ring timeout last. (Unquoted, the
-// fixed seven-slot command would have been ten arguments: -USAGE.)
-func TestOriginateChromeExtensionRequest(t *testing.T) {
-	fs := newFakeFreeSWITCH(t, "ClueCon-test", replyWith("+OK "+fxCallX+"\n"))
-	h, es := originateHandlerFor(fs)
-	rec := originate(t, h, fxUser1, fxDomainA, map[string]any{
-		"aleg":             "user/101@acme.example.com",
-		"bleg":             "&transfer(5145550199 XML acme.example.com)",
-		"caller_id_name":   "5145550199",
-		"caller_id_number": "5145550199",
-		"timeout_sec":      30,
-	})
-	if rec.Code != http.StatusOK || registeredCalls(es)[fxCallX] == nil {
-		t.Fatalf("status %d: %s", rec.Code, rec.Body)
-	}
-	want := "originate {originate_timeout=30,origination_caller_id_number=5145550199,origination_caller_id_name=5145550199}user/101@acme.example.com '&transfer(5145550199 XML acme.example.com)' undef undef undef undef 30"
-	cmd := strings.TrimPrefix(fs.commands()[1], "1:api ")
-	if cmd != want {
-		t.Fatalf("command\n got: %q\nwant: %q", cmd, want)
-	}
-	args := fsOriginateArgs(t, cmd)
-	if len(args) != 7 || args[1] != "&transfer(5145550199 XML acme.example.com)" || args[6] != "30" {
-		t.Fatalf("FreeSWITCH would see %d args %q", len(args), args)
-	}
-}
-
 // Every route around the ring timeout is refused with 400 before anything is
 // dialed: inline variables in aleg/bleg, argument-shifting characters, and
 // channel variables that change originate timing (any case).
@@ -434,7 +406,7 @@ func TestOriginateRefusesTimeoutOverrides(t *testing.T) {
 		"user_recurse_variables false": {"aleg": aleg, "channel_variables": map[string]any{"user_recurse_variables": false}},
 		"User_Recurse_Variables":       {"aleg": aleg, "channel_variables": map[string]any{"User_Recurse_Variables": "false"}},
 		"nested-vars marker in value":  {"aleg": aleg, "channel_variables": map[string]any{"foo": "origination_nested_vars=true"}},
-		"nested-vars marker in cid":    {"aleg": aleg, "caller_id_name": "x origination_nested_vars=true"},
+		"nested-vars marker in cid":    {"aleg": aleg, "caller_id_name": "x origination_nested_vars"},
 		"key starting ^^":              {"aleg": aleg, "channel_variables": map[string]any{"^^:foo": "1"}},
 		"bleg {originate_timeout}":     {"aleg": aleg, "bleg": "{originate_timeout=300}&park()"},
 		"bleg [leg_timeout]":           {"aleg": aleg, "bleg": "[leg_timeout=300]1001"},
@@ -453,9 +425,37 @@ func TestOriginateRefusesTimeoutOverrides(t *testing.T) {
 		"key with =":                   {"aleg": aleg, "channel_variables": map[string]any{"originate_timeout=300,foo": "1"}},
 		"value is an object":           {"aleg": aleg, "channel_variables": map[string]any{"foo": map[string]any{"a": 1}}},
 	}
-	for v := range originateTimingVars {
+	for _, v := range []string{"originate_timeout", "call_timeout", "leg_timeout", "originate_retries", "group_confirm_key"} {
 		cases["timing var "+v] = map[string]any{"aleg": aleg, "channel_variables": map[string]any{v: 300}}
 		cases["timing var "+strings.ToUpper(v)] = map[string]any{"aleg": aleg, "channel_variables": map[string]any{strings.ToUpper(v): 300}}
+	}
+	// U46: no callback_url (fs-api would POST call events to it from the PBX
+	// host), and a bleg number routes only in a named context.
+	cases["callback_url"] = map[string]any{"aleg": aleg, "callback_url": "https://hooks.example.com/x"}
+	cases["bleg number without a context"] = map[string]any{"aleg": aleg, "bleg": "5145550199"}
+	// U46: the caller ID name is the one free-text field; nothing a dial
+	// string reads as a separator gets in.
+	for _, name := range []string{"x:_:y", "a|b", "x=y", `back\slash`, `say "hi"`, "$var", "^^:x", "100%", "a@b", "a/b", "a:b", "a;b", "a\tb"} {
+		cases["cid name "+name] = map[string]any{"aleg": aleg, "caller_id_name": name}
+	}
+	// U46: only one user/<extension>@<domain> A-leg, a park or dialplan
+	// B-leg, digits for the caller ID number, and no channel variables.
+	for name, body := range map[string]map[string]any{
+		"forked aleg":                {"aleg": aleg + ",user/102@acme.example.com"},
+		"enterprise aleg":            {"aleg": aleg + ":_:user/102@acme.example.com"},
+		"gateway aleg":               {"aleg": "sofia/gateway/carrier/+15145550199"},
+		"loopback aleg":              {"aleg": "loopback/101/acme.example.com"},
+		"aleg without a domain":      {"aleg": "user/101"},
+		"aleg extension with a dot":  {"aleg": "user/.101@acme.example.com"},
+		"bleg application":           {"aleg": aleg, "bleg": "&echo"},
+		"bleg application with args": {"aleg": aleg, "bleg": "&park(x)"},
+		"bleg leading dash":          {"aleg": aleg, "bleg": "-1001"},
+		"dialplan other than XML":    {"aleg": aleg, "dialplan": "inline"},
+		"caller_id_number letters":   {"aleg": aleg, "caller_id_number": "5145550100x"},
+		"any channel variable":       {"aleg": aleg, "channel_variables": map[string]any{"sip_h_X-Ticket": "T-42"}},
+		"origination_uuid not uuid":  {"aleg": aleg, "channel_variables": map[string]any{"origination_uuid": "x y"}},
+	} {
+		cases[name] = body
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -472,17 +472,16 @@ func TestOriginateRefusesTimeoutOverrides(t *testing.T) {
 	}
 }
 
-// Ordinary values stay accepted: forked and gateway dial strings, &app with
-// and without arguments, a spaced caller ID name, plain channel variables.
+// Ordinary values stay accepted: a number or feature code as the B-leg,
+// park, a spaced caller ID name, an E.164 caller ID number.
 func TestOriginateAcceptsOrdinaryInput(t *testing.T) {
 	for name, body := range map[string]map[string]any{
-		"forked aleg":       {"aleg": "user/101@acme.example.com,user/102@acme.example.com"},
-		"enterprise aleg":   {"aleg": "user/101@acme.example.com:_:user/102@acme.example.com"},
-		"gateway aleg":      {"aleg": "sofia/gateway/carrier/+15145550199"},
-		"plain bleg":        {"aleg": "user/101@acme.example.com", "bleg": "5145550199"},
-		"app without args":  {"aleg": "user/101@acme.example.com", "bleg": "&echo"},
-		"spaced cid name":   {"aleg": "user/101@acme.example.com", "caller_id_name": "Front Desk"},
-		"channel variables": {"aleg": "user/101@acme.example.com", "channel_variables": map[string]any{"sip_h_X-Ticket": "T-42", "ignore_early_media": true, "hold_music": "local_stream://moh"}},
+		"plain bleg":         {"aleg": "user/101@acme.example.com", "bleg": "5145550199", "context": "acme.example.com"},
+		"feature-code bleg":  {"aleg": "user/101@acme.example.com", "bleg": "*99101", "context": "acme.example.com"},
+		"explicit park":      {"aleg": "user/101@acme.example.com", "bleg": "&park()"},
+		"spaced cid name":    {"aleg": "user/101@acme.example.com", "caller_id_name": "Front Desk"},
+		"e164 cid number":    {"aleg": "user/101@acme.example.com", "caller_id_number": "+15145550100"},
+		"empty channel vars": {"aleg": "user/101@acme.example.com", "channel_variables": map[string]any{}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			fs := newFakeFreeSWITCH(t, "ClueCon-test", replyWith("+OK "+fxCallX+"\n"))
@@ -503,9 +502,8 @@ func TestOriginateAcceptsOrdinaryInput(t *testing.T) {
 // arguments with the ring timeout last.
 func TestOriginateCallerIDNameRoundTrip(t *testing.T) {
 	names := []string{
-		"O'Brien", "Smith, John", "D'Arcy O'Neil", "it's, ok", `back\slash`, `a\sb`, `\n`, `\'`,
-		"x' undef 300 '", "x,originate_timeout=300", "x\\,originate_timeout=300", "a,,b", "''", "'", ",",
-		"Front Desk", "  padded  ", "Zoë Ångström", `say "hi"`, "x=y", "^^:x", "$var", "100%",
+		"O'Brien", "Smith, John", "D'Arcy O'Neil", "it's, ok", "x' undef 300 '", "a,,b", "''", "'", ",",
+		"Front Desk", "  padded  ", "Zoë Ångström", "Dr. Lee (Suite 4)", "Unit #2 + 3", "Jean-Luc_Ç",
 	}
 	for _, name := range names {
 		t.Run(name, func(t *testing.T) {

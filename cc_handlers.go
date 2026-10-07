@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -48,14 +49,13 @@ func filterByDomain(rows []map[string]string, fieldName string, allowedContexts 
 	return filtered
 }
 
-// filterAgentsByDomain filters agent rows by extracting the domain from the
-// "contact" field using ExtractDomainFromContact.
+// filterAgentsByDomain keeps the agents owned by one of the allowed contexts,
+// by the same rule that decides who may change an agent (agentRowOwner).
 func filterAgentsByDomain(rows []map[string]string, allowedContexts []string) []map[string]string {
 	filtered := make([]map[string]string, 0)
 	for _, row := range rows {
-		contact := row["contact"]
-		domain := ExtractDomainFromContact(contact)
-		if domain == "" {
+		domain := agentRowOwner(row)
+		if domain == "" || domain == unknownOwner {
 			continue
 		}
 		for _, ctx := range allowedContexts {
@@ -68,42 +68,22 @@ func filterAgentsByDomain(rows []map[string]string, allowedContexts []string) []
 	return filtered
 }
 
-// validateCCDomain pre-validates domain for write ops on queues/tiers where
-// the entity name is in "name@domain" format. Returns true if allowed,
-// false if forbidden (and writes error response).
+// validateCCDomain checks a queue name: <short>@<domain> in its shape (400
+// otherwise), in one of the caller's allowed contexts (403 otherwise).
+// Writes the error response and returns false when refused.
 func (h *APIHandler) validateCCDomain(w http.ResponseWriter, r *http.Request, entityName, entityType string) bool {
-	if isUnrestrictedAccess(r) {
-		return true
-	}
-	allowedContexts := getAllowedContexts(r)
-	if isDomainAllowed(entityName, allowedContexts) {
-		return true
+	if !validQueueName(entityName) {
+		h.respondError(w, r, fmt.Sprintf("%s name must be <name>@<domain>", entityType), http.StatusBadRequest)
+		return false
 	}
 	domain := extractDomain(entityName)
-	allowedList := strings.Join(allowedContexts, ", ")
+	if contextAllowed(r, domain) {
+		return true
+	}
+	allowedList := strings.Join(getAllowedContexts(r), ", ")
 	h.respondError(w, r,
 		fmt.Sprintf("%s '%s' belongs to domain '%s' which is not in your allowed contexts: [%s]",
 			entityType, entityName, domain, allowedList),
-		http.StatusForbidden)
-	return false
-}
-
-// validateCCDomainRaw pre-validates a raw domain string (for agent write ops
-// where domain comes from the request body). Returns true if allowed.
-func (h *APIHandler) validateCCDomainRaw(w http.ResponseWriter, r *http.Request, domain, entityType string) bool {
-	if isUnrestrictedAccess(r) {
-		return true
-	}
-	allowedContexts := getAllowedContexts(r)
-	for _, ctx := range allowedContexts {
-		if domain == ctx {
-			return true
-		}
-	}
-	allowedList := strings.Join(allowedContexts, ", ")
-	h.respondError(w, r,
-		fmt.Sprintf("%s domain '%s' is not in your allowed contexts: [%s]",
-			entityType, domain, allowedList),
 		http.StatusForbidden)
 	return false
 }
@@ -117,10 +97,16 @@ func (h *APIHandler) respondJSON(w http.ResponseWriter, r *http.Request, data in
 	json.NewEncoder(w).Encode(data)
 }
 
-// sendCCCommand sends a callcenter_config command via ESL and returns the response.
+// sendCCCommand sends a callcenter_config command via ESL and returns the
+// response. mod_callcenter reports a refused change as an "-ERR ..." reply
+// body, which is returned as an ESL error rather than as success.
 func (h *APIHandler) sendCCCommand(args string) (string, error) {
 	cmd := fmt.Sprintf("api callcenter_config %s", args)
-	return h.eslClient.SendCommand(cmd)
+	response, err := h.eslClient.SendCommand(cmd)
+	if err == nil && strings.HasPrefix(strings.TrimSpace(response), "-ERR") {
+		return response, fmt.Errorf("ESL error: %s", strings.TrimSpace(response))
+	}
+	return response, err
 }
 
 // --- Queue handlers ---
@@ -250,10 +236,14 @@ func (h *APIHandler) CCCountQueueAgents(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Build count command with optional status filter
+	// Optional status filter, quoted: "On Break" is one argument.
 	cmd := fmt.Sprintf("queue count agents %s", queueName)
 	if status := r.URL.Query().Get("status"); status != "" {
-		cmd = fmt.Sprintf("queue count agents %s %s", queueName, status)
+		if !agentStatuses[status] {
+			h.respondError(w, r, "status must be an agent status", http.StatusBadRequest)
+			return
+		}
+		cmd = fmt.Sprintf("queue count agents %s %s", queueName, fsQuote(status))
 	}
 
 	response, err := h.sendCCCommand(cmd)
@@ -401,37 +391,46 @@ func (h *APIHandler) CCAddAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Name == "" {
-		h.respondError(w, r, "name is required", http.StatusBadRequest)
+	if !validAgentName(req.Name) {
+		h.respondError(w, r, "name must be the agent's uuid or <name>@<domain>", http.StatusBadRequest)
 		return
 	}
-	if req.Type == "" {
-		h.respondError(w, r, "type is required", http.StatusBadRequest)
-		return
-	}
-	if req.Type != "callback" && req.Type != "uuid-standby" {
+	if !agentTypes[req.Type] {
 		h.respondError(w, r, "type must be 'callback' or 'uuid-standby'", http.StatusBadRequest)
 		return
 	}
-
-	// Validate domain for auth
-	if req.Domain == "" && !isUnrestrictedAccess(r) {
-		h.respondError(w, r, "domain is required for authorization", http.StatusBadRequest)
+	// An agent named <name>@<domain> belongs to that domain. One named by its
+	// uuid (FusionPBX's name) has no tenant until its contact is set; the
+	// contact can only be set in one of the caller's own contexts.
+	domain, qualified := splitQualified(req.Name, agentLocalPattern)
+	if qualified && !contextAllowed(r, domain) {
+		h.respondError(w, r, fmt.Sprintf("Agent domain '%s' is not in your allowed contexts", domain), http.StatusForbidden)
 		return
 	}
-	if req.Domain != "" {
-		if !h.validateCCDomainRaw(w, r, req.Domain, "Agent") {
+	// A uuid-named agent from a restricted caller is recorded as that tenant's
+	// until its contact is set, so the caller must name exactly one tenant.
+	claimFor := ""
+	if !qualified && !isUnrestrictedAccess(r) {
+		allowed := getAllowedContexts(r)
+		if len(allowed) != 1 {
+			h.respondError(w, r, "Adding an agent by uuid needs exactly one allowed context", http.StatusBadRequest)
 			return
 		}
+		claimFor = allowed[0]
 	}
 
-	_, err := h.sendCCCommand(fmt.Sprintf("agent add %s %s", req.Name, req.Type))
+	// On the serialized connection: whether this add succeeded decides the claim.
+	ctx, cancel := context.WithTimeout(context.Background(), channelDumpTimeout)
+	defer cancel()
+	_, err := h.serial.API(ctx, fmt.Sprintf("callcenter_config agent add %s %s", req.Name, req.Type))
 	if err != nil {
-		statusCode := h.getErrorStatusCode(err)
-		h.respondError(w, r, fmt.Sprintf("Failed to add agent: %v", err), statusCode)
+		h.respondError(w, r, fmt.Sprintf("Failed to add agent: %v", err), http.StatusBadGateway)
 		return
 	}
 
+	if claimFor != "" {
+		h.agentClaims.record(req.Name, claimFor)
+	}
 	h.respondSuccess(w, r, fmt.Sprintf("Agent %s added with type %s", req.Name, req.Type))
 }
 
@@ -439,24 +438,12 @@ func (h *APIHandler) CCAddAgent(w http.ResponseWriter, r *http.Request) {
 func (h *APIHandler) CCDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	agentName := mux.Vars(r)["agent_name"]
 
-	var req AgentDelRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		// Allow empty body for unrestricted access
-		if !isUnrestrictedAccess(r) {
-			h.respondError(w, r, "Invalid request body: domain is required for authorization", http.StatusBadRequest)
-			return
-		}
-	}
-
-	// Validate domain for auth
-	if req.Domain == "" && !isUnrestrictedAccess(r) {
-		h.respondError(w, r, "domain is required for authorization", http.StatusBadRequest)
+	if !validAgentName(agentName) {
+		h.respondError(w, r, "agent must be its uuid or <name>@<domain>", http.StatusBadRequest)
 		return
 	}
-	if req.Domain != "" {
-		if !h.validateCCDomainRaw(w, r, req.Domain, "Agent") {
-			return
-		}
+	if !h.authorizeAgent(w, r, agentName, "") {
+		return
 	}
 
 	_, err := h.sendCCCommand(fmt.Sprintf("agent del %s", agentName))
@@ -465,6 +452,7 @@ func (h *APIHandler) CCDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, r, fmt.Sprintf("Failed to delete agent: %v", err), statusCode)
 		return
 	}
+	h.agentClaims.clear(agentName)
 
 	h.respondSuccess(w, r, fmt.Sprintf("Agent %s deleted", agentName))
 }
@@ -479,38 +467,54 @@ func (h *APIHandler) CCSetAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Key == "" {
-		h.respondError(w, r, "key is required", http.StatusBadRequest)
+	if !validAgentName(agentName) {
+		h.respondError(w, r, "agent must be its uuid or <name>@<domain>", http.StatusBadRequest)
 		return
 	}
-	if !validAgentSetKeys[req.Key] {
-		h.respondError(w, r, fmt.Sprintf("invalid key '%s': must be one of: status, state, contact, type, max_no_answer, wrap_up_time, reject_delay_time, busy_delay_time, ready_time", req.Key), http.StatusBadRequest)
+	if !validAgentValue(req.Key, req.Value) {
+		h.respondError(w, r, fmt.Sprintf("%q can't be set to that value (keys: status, state, contact, type, max_no_answer, wrap_up_time, reject_delay_time, busy_delay_time, no_answer_delay_time, ready_time)", req.Key), http.StatusBadRequest)
 		return
 	}
-
-	// Validate domain for auth
-	if req.Domain == "" && !isUnrestrictedAccess(r) {
-		h.respondError(w, r, "domain is required for authorization", http.StatusBadRequest)
-		return
-	}
-	if req.Domain != "" {
-		if !h.validateCCDomainRaw(w, r, req.Domain, "Agent") {
+	// A contact names the tenant the agent then rings in: it must be one of
+	// the caller's own, whoever owned the agent before.
+	claim := ""
+	if req.Key == "contact" {
+		domain, _ := contactDomain(req.Value)
+		if !contextAllowed(r, domain) {
+			h.respondError(w, r, fmt.Sprintf("Contact domain '%s' is not in your allowed contexts", domain), http.StatusForbidden)
 			return
 		}
+		claim = req.Value
+	}
+	if !h.authorizeAgent(w, r, agentName, claim) {
+		return
 	}
 
 	// Command format: agent set <key> <agent_name> <value>
-	_, err := h.sendCCCommand(fmt.Sprintf("agent set %s %s '%s'", req.Key, agentName, req.Value))
+	_, err := h.sendCCCommand(fmt.Sprintf("agent set %s %s %s", req.Key, agentName, fsQuote(req.Value)))
 	if err != nil {
 		statusCode := h.getErrorStatusCode(err)
 		h.respondError(w, r, fmt.Sprintf("Failed to set agent %s: %v", req.Key, err), statusCode)
 		return
 	}
 
+	if req.Key == "contact" {
+		h.agentClaims.clear(agentName)
+	}
 	h.respondSuccess(w, r, fmt.Sprintf("Agent %s %s set to '%s'", agentName, req.Key, req.Value))
 }
 
 // --- Tier handlers ---
+
+// validateTierAgent checks a tier's agent: in its shape (400), and one of the
+// caller's own tenant's agents (authorizeAgent).
+func (h *APIHandler) validateTierAgent(w http.ResponseWriter, r *http.Request, agent string) bool {
+	if !validAgentName(agent) {
+		h.respondError(w, r, "agent must be its uuid or <name>@<domain>", http.StatusBadRequest)
+		return false
+	}
+	return h.authorizeAgent(w, r, agent, "")
+}
 
 // CCListTiers handles GET /v1/callcenter/tiers
 func (h *APIHandler) CCListTiers(w http.ResponseWriter, r *http.Request) {
@@ -551,8 +555,15 @@ func (h *APIHandler) CCAddTier(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate queue domain for auth
-	if !h.validateCCDomain(w, r, req.Queue, "Queue") {
+	if !h.validateCCDomain(w, r, req.Queue, "Queue") || !h.validateTierAgent(w, r, req.Agent) {
+		return
+	}
+	if (req.Level != "" && !smallNumberPattern.MatchString(req.Level)) || (req.Position != "" && !smallNumberPattern.MatchString(req.Position)) {
+		h.respondError(w, r, "level and position must be whole numbers", http.StatusBadRequest)
+		return
+	}
+	if req.Position != "" && req.Level == "" {
+		h.respondError(w, r, "position needs a level", http.StatusBadRequest)
 		return
 	}
 
@@ -592,8 +603,7 @@ func (h *APIHandler) CCDeleteTier(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate queue domain for auth
-	if !h.validateCCDomain(w, r, req.Queue, "Queue") {
+	if !h.validateCCDomain(w, r, req.Queue, "Queue") || !h.validateTierAgent(w, r, req.Agent) {
 		return
 	}
 
@@ -624,22 +634,16 @@ func (h *APIHandler) CCSetTier(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, r, "agent is required", http.StatusBadRequest)
 		return
 	}
-	if req.Key == "" {
-		h.respondError(w, r, "key is required", http.StatusBadRequest)
+	if !validTierValue(req.Key, req.Value) {
+		h.respondError(w, r, fmt.Sprintf("%q can't be set to that value (keys: state, level, position)", req.Key), http.StatusBadRequest)
 		return
 	}
-	if !validTierSetKeys[req.Key] {
-		h.respondError(w, r, fmt.Sprintf("invalid key '%s': must be one of: state, level, position", req.Key), http.StatusBadRequest)
-		return
-	}
-
-	// Validate queue domain for auth
-	if !h.validateCCDomain(w, r, req.Queue, "Queue") {
+	if !h.validateCCDomain(w, r, req.Queue, "Queue") || !h.validateTierAgent(w, r, req.Agent) {
 		return
 	}
 
 	// Command format: tier set <key> <queue> <agent> <value>
-	_, err := h.sendCCCommand(fmt.Sprintf("tier set %s %s %s '%s'", req.Key, req.Queue, req.Agent, req.Value))
+	_, err := h.sendCCCommand(fmt.Sprintf("tier set %s %s %s %s", req.Key, req.Queue, req.Agent, fsQuote(req.Value)))
 	if err != nil {
 		statusCode := h.getErrorStatusCode(err)
 		h.respondError(w, r, fmt.Sprintf("Failed to set tier %s: %v", req.Key, err), statusCode)

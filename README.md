@@ -259,7 +259,7 @@ curl -H "X-Allowed-Contexts: customer1.example.com" \
   -X POST http://localhost:37274/v1/calls/originate \
   -H "Content-Type: application/json" \
   -d '{
-    "aleg": "user/1000",
+    "aleg": "user/1000@customer1.example.com",
     "bleg": "&park()",
     "context": "customer1.example.com"
   }'
@@ -303,14 +303,14 @@ The following endpoints enforce context authorization when `X-Allowed-Contexts` 
 - ✅ `POST /v1/calls/{uuid}/record` - Start/stop recording
 - ✅ `POST /v1/calls/{uuid}/dtmf` - Send DTMF
 - ✅ `POST /v1/calls/{uuid}/park` - Park call
-- ✅ `POST /v1/calls/{uuid}/conference` - Add a participant ("add people"); uses the stock `default` conference profile and forwards the originating extension's `toll_allow` so external dial-out is gated like a normal call
+- ✅ `POST /v1/calls/{uuid}/conference` - Add a participant ("add people") in an fs-api `sp-<uuid>` room on the `softphone` profile; the bridged partner must be the same tenant; the caller's `toll_allow` gates external dial-out like a normal call
 - ✅ `POST /v1/calls/bridge` - Bridge two calls (validates both UUIDs)
 - ✅ `POST /v1/calls/originate` - Originate call (validates context parameter)
 - ✅ All `/v1/callcenter/queues/*` endpoints - Validated by queue `name@domain`
-- ✅ All `/v1/callcenter/agents/*` endpoints - Validated by `domain` in request body (agent names are UUIDs; domain lives in the `contact` field)
+- ✅ All `/v1/callcenter/agents/*` endpoints - The agent must belong to an allowed context: its contact's `domain_name=`, its `user/<ext>@<domain>` contact, or its `<name>@<domain>` name (a `domain` body field is ignored)
 - ✅ All `/v1/callcenter/tiers/*` endpoints - Validated by queue `name@domain`
 - ✅ `GET /v1/callcenter/queues` - List filtered by queue domain
-- ✅ `GET /v1/callcenter/agents` - List filtered by `domain_name=` in agent contact
+- ✅ `GET /v1/callcenter/agents` - List filtered by the same agent-ownership rule
 - ✅ `GET /v1/callcenter/tiers` - List filtered by queue domain
 - ✅ `GET /v1/registrations` - List filtered by `realm` field
 - ✅ `GET /v1/registrations/count` - Count filtered by `realm` field
@@ -764,9 +764,11 @@ POST /v1/calls/{uuid}/record
 ```json
 {
   "action": "start",
-  "filename": "/var/spool/fs/recordings/call_12345.wav"
+  "filename": "/var/lib/freeswitch/recordings/customer1.example.com/call_12345.wav"
 }
 ```
+
+The file must be a `.wav` or `.mp3` under `/var/lib/freeswitch/recordings/<the call's domain>/`; anything else is refused with 400.
 
 **Request Body for Stop**:
 ```json
@@ -780,7 +782,7 @@ POST /v1/calls/{uuid}/record
 # Start recording
 curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcdef/record \
   -H "Content-Type: application/json" \
-  -d '{"action":"start","filename":"/var/spool/fs/recordings/call_12345.wav"}'
+  -d '{"action":"start","filename":"/var/lib/freeswitch/recordings/customer1.example.com/call_12345.wav"}'
 
 # Stop recording
 curl -X POST http://localhost:37274/v1/calls/a1b2c3d4-e5f6-7890-1234-567890abcdef/record \
@@ -917,58 +919,35 @@ POST /v1/calls/originate
 **Request Body** (required):
 ```json
 {
-  "aleg": "sofia/default/1001@domain.com",
+  "aleg": "user/1001@customer1.example.com",
   "bleg": "9005551212",
   "dialplan": "XML",
-  "context": "default",
+  "context": "customer1.example.com",
   "caller_id_name": "John Doe",
   "caller_id_number": "5551234567",
-  "timeout_sec": 60,
-  "channel_variables": {
-    "origination_caller_id_number": "9005551212",
-    "ignore_early_media": true,
-    "hangup_after_bridge": true
-  }
+  "timeout_sec": 60
 }
 ```
 
-**Required Fields**:
-- `aleg`: The A-leg (originating) endpoint (e.g., `sofia/default/user@domain.com`)
-- `bleg`: The B-leg destination - can be an extension number or an application (e.g., `5000` or `&bridge(sofia/default/1002@domain.com)`)
+Every field must match its shape or the request is refused with 400 (`originate_input.go`); a domain outside X-Allowed-Contexts is 403:
+- `aleg` (required): one `user/<extension>@<domain>`.
+- `bleg`: `&park()` (the default), or a dialplan extension, number or feature code, which needs `context`.
+- `dialplan`: `XML`. `context`: a domain name.
+- `caller_id_name`: letters, digits, spaces and `. , ' _ ( ) # + -`. `caller_id_number`: digits with an optional leading `+`.
+- `timeout_sec`: ring timeout, at most 85 (default 60).
+- `channel_variables`: only `origination_uuid` (a canonical uuid). `callback_url` is not accepted.
 
-**Optional Fields**:
-- `dialplan`: Dialplan to use (default: none)
-- `context`: Dialplan context (default: none)
-- `caller_id_name`: Caller ID name to display
-- `caller_id_number`: Caller ID number to display
-- `timeout_sec`: Call timeout in seconds
-- `channel_variables`: Object containing FreeSWITCH channel variables as key-value pairs
-
-**Example 1 - Dialplan-based call**:
+**Example**:
 ```bash
 curl -X POST http://localhost:37274/v1/calls/originate \
   -H "Content-Type: application/json" \
+  -H "X-Allowed-Contexts: customer1.example.com" \
   -d '{
-    "aleg": "sofia/default/1001@domain.com",
+    "aleg": "user/1001@customer1.example.com",
     "bleg": "9005551212",
-    "dialplan": "XML",
-    "context": "default",
+    "context": "customer1.example.com",
     "caller_id_name": "Test Call",
     "caller_id_number": "5551234567"
-  }'
-```
-
-**Example 2 - Direct bridge (bypass dialplan)**:
-```bash
-curl -X POST http://localhost:37274/v1/calls/originate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "aleg": "sofia/default/1001@domain.com",
-    "bleg": "&bridge(sofia/default/1002@domain.com)",
-    "channel_variables": {
-      "origination_caller_id_number": "9005551212",
-      "ignore_early_media": true
-    }
   }'
 ```
 
@@ -1110,14 +1089,19 @@ Queue names use `name@domain` format (e.g. `support@customer1.example.com`).
 | `PUT` | `/v1/callcenter/agents/{agent_name}` | Set an agent attribute |
 | `DELETE` | `/v1/callcenter/agents/{agent_name}` | Delete an agent |
 
-Agent names are UUIDs. The `domain` field in the request body is used for authorization since the domain is stored in the agent's `contact` field (as `domain_name=<value>`), not in the agent name.
+Agents are named by their FusionPBX uuid (or `<name>@<domain>`). An agent belongs to the tenant in its contact (`domain_name=<value>`, or `user/<ext>@<domain>`) or its `<name>@<domain>` name; any `domain` body field is ignored. A uuid-named agent added by a restricted caller (exactly one allowed context, 400 otherwise) belongs to that tenant until its contact is set: only that tenant may change or delete it, and its contact must be in that tenant. fs-api remembers this per box, in memory, for 10 minutes, so set the contact right after the add; an agent added by an unrestricted caller, by FusionPBX, or before an fs-api restart can only get its first contact from an unrestricted caller.
 
-**Add agent**:
+**Add agent, then give it a contact**:
 ```bash
 curl -X POST http://localhost:37274/v1/callcenter/agents \
   -H "Content-Type: application/json" \
   -H "X-Allowed-Contexts: customer1.example.com" \
-  -d '{"name":"a1b2c3d4-e5f6-7890-1234-567890abcdef","type":"callback","domain":"customer1.example.com"}'
+  -d '{"name":"a1b2c3d4-e5f6-7890-1234-567890abcdef","type":"callback"}'
+
+curl -X PUT http://localhost:37274/v1/callcenter/agents/a1b2c3d4-e5f6-7890-1234-567890abcdef \
+  -H "Content-Type: application/json" \
+  -H "X-Allowed-Contexts: customer1.example.com" \
+  -d '{"key":"contact","value":"user/1001@customer1.example.com"}'
 ```
 
 **Set agent status**:
@@ -1125,10 +1109,10 @@ curl -X POST http://localhost:37274/v1/callcenter/agents \
 curl -X PUT http://localhost:37274/v1/callcenter/agents/a1b2c3d4-e5f6-7890-1234-567890abcdef \
   -H "Content-Type: application/json" \
   -H "X-Allowed-Contexts: customer1.example.com" \
-  -d '{"key":"status","value":"Available","domain":"customer1.example.com"}'
+  -d '{"key":"status","value":"Available"}'
 ```
 
-Valid agent set keys: `status`, `state`, `contact`, `type`, `max_no_answer`, `wrap_up_time`, `reject_delay_time`, `busy_delay_time`, `ready_time`.
+Valid agent set keys and values: see `AgentSetRequest` in `openapi.yaml` (`status`, `state`, `contact` = `user/<ext>@<domain>`, `type`, the delay/timer numbers incl. `no_answer_delay_time`, `ready_time`).
 
 ### Tier Endpoints
 
@@ -1191,7 +1175,7 @@ The resolve endpoint is called with `{ "p_extension": "101", "p_domain_name": "e
 
 ### Originated Call Events
 
-For calls initiated via `/v1/calls/originate`, fs-api tracks the call UUID and forwards all ESL events (CHANNEL_CREATE, CHANNEL_ANSWER, CHANNEL_BRIDGE, CHANNEL_HANGUP, CHANNEL_DESTROY) as `call_event` messages to the originating user. Optional per-call callback URLs are also supported.
+For calls initiated via `/v1/calls/originate`, fs-api tracks the call UUID and forwards all ESL events (CHANNEL_CREATE, CHANNEL_ANSWER, CHANNEL_BRIDGE, CHANNEL_HANGUP, CHANNEL_DESTROY) as `call_event` messages to the originating user.
 
 ## Architecture
 

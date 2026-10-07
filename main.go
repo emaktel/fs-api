@@ -34,7 +34,8 @@ const serverWriteTimeout = 120 * time.Second
 
 func main() {
 	// One serialized ESL connection for the commands whose reply decides who a
-	// call belongs to (uuid_dump): call authorization and call details.
+	// call or agent belongs to: uuid_dump (call authorization and details) and
+	// the agent list (call-center agent ownership).
 	channelDumps := newESLSerialClient(ESL_HOST, ESL_PORT, ESL_PASSWORD)
 	handler := NewAPIHandler(ESL_HOST, ESL_PORT, ESL_PASSWORD, channelDumps)
 

@@ -27,8 +27,12 @@ func getRequestID(r *http.Request) string {
 // API Handlers
 type APIHandler struct {
 	eslClient ESLClient
-	// channelDumps runs uuid_dump on the serialized connection (see eslSerialClient).
+	// channelDumps runs uuid_dump, and serial the call-center commands that
+	// decide agent ownership, on the serialized connection (see eslSerialClient).
 	channelDumps channelDumper
+	serial       serialAPI
+	// agentClaims: which tenant added each agent still waiting for its contact.
+	agentClaims agentClaims
 	// originateESL runs each originate on its own connection (see eslOneShot);
 	// originateSlots holds one token per in-flight originate.
 	originateESL    eslOneShot
@@ -36,10 +40,11 @@ type APIHandler struct {
 	eventSubscriber *EventSubscriber
 }
 
-func NewAPIHandler(eslHost, eslPort, eslPassword string, channelDumps channelDumper) *APIHandler {
+func NewAPIHandler(eslHost, eslPort, eslPassword string, serial *eslSerialClient) *APIHandler {
 	return &APIHandler{
 		eslClient:      NewESLClient(eslHost, eslPort, eslPassword),
-		channelDumps:   channelDumps,
+		channelDumps:   serial,
+		serial:         serial,
 		originateESL:   newESLOneShot(eslHost, eslPort, eslPassword),
 		originateSlots: make(chan struct{}, maxConcurrentOriginates),
 	}
@@ -123,6 +128,10 @@ func (h *APIHandler) HangupCall(w http.ResponseWriter, r *http.Request) {
 	if req.Cause == "" {
 		req.Cause = "NORMAL_CLEARING"
 	}
+	if !hangupCausePattern.MatchString(req.Cause) {
+		h.respondError(w, r, "cause must be a hangup cause name such as NORMAL_CLEARING, or a Q.850 code", http.StatusBadRequest)
+		return
+	}
 
 	cmd := fmt.Sprintf("api uuid_kill %s %s", callUUID, req.Cause)
 	_, err := h.eslClient.SendCommand(cmd)
@@ -157,10 +166,27 @@ func (h *APIHandler) TransferCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Only destination is required
-	if req.Destination == "" {
-		h.respondError(w, r, "destination is required", http.StatusBadRequest)
+	if !dialTargetPattern.MatchString(req.Destination) {
+		h.respondError(w, r, "destination must be an extension, a number or a feature code", http.StatusBadRequest)
 		return
+	}
+	if req.Dialplan != "" && req.Dialplan != "XML" {
+		h.respondError(w, r, "dialplan must be XML", http.StatusBadRequest)
+		return
+	}
+	if req.Dialplan != "" && req.Context == "" {
+		h.respondError(w, r, "dialplan needs a context", http.StatusBadRequest)
+		return
+	}
+	if req.Context != "" {
+		if !domainNamePattern.MatchString(req.Context) {
+			h.respondError(w, r, "context must be a domain name", http.StatusBadRequest)
+			return
+		}
+		if !contextAllowed(r, req.Context) {
+			h.respondError(w, r, fmt.Sprintf("Cannot transfer into context '%s': not in your allowed contexts", req.Context), http.StatusForbidden)
+			return
+		}
 	}
 
 	// Default to "aleg" if not specified
@@ -354,7 +380,8 @@ func (h *APIHandler) ControlRecording(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate call context
-	if _, ok := h.validateCallContext(w, r, callUUID); !ok {
+	callInfo, ok := h.validateCallContext(w, r, callUUID)
+	if !ok {
 		return
 	}
 
@@ -371,13 +398,12 @@ func (h *APIHandler) ControlRecording(w http.ResponseWriter, r *http.Request) {
 
 	var cmd string
 	if req.Action == "start" {
-		if req.Filename == "" {
-			h.respondError(w, r, "filename is required for start action", http.StatusBadRequest)
-			return
-		}
-		// Validate file path
-		if err := validateFilePath(req.Filename); err != nil {
-			h.respondError(w, r, fmt.Sprintf("Invalid filename: %v", err), http.StatusBadRequest)
+		// Only an audio file in the call's own tenant folder: uuid_record
+		// writes as the FreeSWITCH user, wherever it is told to.
+		folder := recordingsRoot + callInfo.AccountCode + "/"
+		name, inFolder := strings.CutPrefix(req.Filename, folder)
+		if !domainNamePattern.MatchString(callInfo.AccountCode) || !inFolder || !recordingPathPattern.MatchString(name) {
+			h.respondError(w, r, fmt.Sprintf("filename must be a .wav or .mp3 file under %s", folder), http.StatusBadRequest)
 			return
 		}
 		cmd = fmt.Sprintf("api uuid_record %s start %s", callUUID, req.Filename)
@@ -417,14 +443,18 @@ func (h *APIHandler) SendDTMF(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Digits == "" {
-		h.respondError(w, r, "digits are required", http.StatusBadRequest)
+	if !dtmfPattern.MatchString(req.Digits) {
+		h.respondError(w, r, "digits must be DTMF digits (0-9, A-D, * and #)", http.StatusBadRequest)
 		return
 	}
 
 	duration := req.Duration
 	if duration == 0 {
 		duration = 100
+	}
+	if duration < minDTMFDurationMs || duration > maxDTMFDurationMs {
+		h.respondError(w, r, fmt.Sprintf("duration must be %d to %d milliseconds", minDTMFDurationMs, maxDTMFDurationMs), http.StatusBadRequest)
+		return
 	}
 
 	cmd := fmt.Sprintf("api uuid_send_dtmf %s %s@%d", callUUID, req.Digits, duration)
@@ -518,19 +548,6 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate required fields
-	if req.ALeg == "" {
-		h.respondError(w, r, "aleg is required", http.StatusBadRequest)
-		return
-	}
-
-	// Validate context if provided
-	if req.Context != "" {
-		if !h.validateRequestContext(w, r, req.Context) {
-			return
-		}
-	}
-
 	// The ring time is bounded by timeout_sec alone, so the originate always
 	// finishes (and its reply reaches the caller) inside the deadline.
 	if req.TimeoutSec > maxOriginateTimeoutSec {
@@ -540,15 +557,20 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 
 	// If bleg is not provided, default to park
 	if req.BLeg == "" {
-		req.BLeg = "&park()"
+		req.BLeg = parkBLeg
 	}
 
-	// Nothing in the request may move the ring timeout or the arguments that
-	// carry it (originate_input.go).
-	vars, err := validateOriginateInput(&req)
+	// Every field in its one accepted shape (originate_input.go), and the
+	// A-leg and context in the caller's own tenants.
+	alegDomain, vars, err := validateOriginateInput(&req)
 	if err != nil {
 		h.respondError(w, r, err.Error(), http.StatusBadRequest)
 		return
+	}
+	for _, domain := range []string{alegDomain, req.Context} {
+		if domain != "" && !h.validateRequestContext(w, r, domain) {
+			return
+		}
 	}
 
 	// Add caller ID as channel variables (these take precedence)
@@ -581,7 +603,7 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 	// variables (above), so its two slots are always undef.
 	var cmd strings.Builder
 	fmt.Fprintf(&cmd, "originate %s%s %s %s %s undef undef %d",
-		channelVars, req.ALeg, originateBLegArg(req.BLeg), orUndef(req.Dialplan), orUndef(req.Context), ringTimeoutSec)
+		channelVars, req.ALeg, req.BLeg, orUndef(req.Dialplan), orUndef(req.Context), ringTimeoutSec)
 
 	// Send the originate on its own ESL connection. The shared connection does
 	// not match replies to requests, so a uuid read from its reply could be
@@ -637,18 +659,12 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 	} else if h.eventSubscriber != nil {
 		userUUID := r.Header.Get("X-User-UUID")
 		domainUUID := r.Header.Get("X-Domain-UUID")
-		allowedContexts := getAllowedContexts(r)
-		domainName := ""
-		if len(allowedContexts) > 0 {
-			domainName = allowedContexts[0]
-		}
 		h.eventSubscriber.RegisterCall(&CallRegistration{
-			CallUUID:    parsedCallUUID,
-			UserUUID:    userUUID,
-			DomainUUID:  domainUUID,
-			DomainName:  domainName,
-			CallbackURL: req.CallbackURL,
-			CreatedAt:   time.Now(),
+			CallUUID:   parsedCallUUID,
+			UserUUID:   userUUID,
+			DomainUUID: domainUUID,
+			DomainName: alegDomain,
+			CreatedAt:  time.Now(),
 		})
 	}
 
@@ -818,7 +834,8 @@ func (h *APIHandler) GetCallDetails(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate call context (this also checks if call exists)
-	if _, ok := h.validateCallContext(w, r, callUUID); !ok {
+	requested, ok := h.validateCallContext(w, r, callUUID)
+	if !ok {
 		return
 	}
 
@@ -849,18 +866,14 @@ func (h *APIHandler) GetCallDetails(w http.ResponseWriter, r *http.Request) {
 	// Find the specific call by UUID (check both A-leg and B-leg UUIDs)
 	var aLegUUID, bLegUUID string
 	var callFound bool
-	for _, row := range callsData.Rows {
-		if row.UUID == callUUID {
-			// Input UUID matches A-leg
+	matched := -1 // the row of this call, in show calls order
+	for i, row := range callsData.Rows {
+		if row.UUID == callUUID || row.BUUID == callUUID {
+			// The input UUID is this call's A-leg or B-leg
 			aLegUUID = row.UUID
 			bLegUUID = row.BUUID
 			callFound = true
-			break
-		} else if row.BUUID == callUUID {
-			// Input UUID matches B-leg
-			aLegUUID = row.UUID
-			bLegUUID = row.BUUID
-			callFound = true
+			matched = i
 			break
 		}
 	}
@@ -897,7 +910,21 @@ func (h *APIHandler) GetCallDetails(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Parse call_info JSON and extract the first row
+	// A call bridged across tenants on one box: the other tenant's leg is
+	// named but its channel details are not returned. The requested leg's
+	// tenant is the one validateCallContext authorized, never inferred from
+	// the other leg.
+	if !isUnrestrictedAccess(r) {
+		if !sameTenant(requested, contextFromDump(aLegUUID, aLegDetails)) {
+			aLegDetails = nil
+		}
+		if bLegDetails != nil && !sameTenant(requested, contextFromDump(bLegUUID, bLegDetails)) {
+			bLegDetails = nil
+		}
+	}
+
+	// Parse call_info JSON and take this call's row (the same index as above:
+	// both parse one reply). Never another row: they are other tenants' calls.
 	var callInfoWrapper struct {
 		RowCount int                      `json:"row_count"`
 		Rows     []map[string]interface{} `json:"rows"`
@@ -908,11 +935,11 @@ func (h *APIHandler) GetCallDetails(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate that we got data (we already validated the call exists)
-	if len(callInfoWrapper.Rows) == 0 {
+	if matched >= len(callInfoWrapper.Rows) {
 		h.respondError(w, r, "Call data not found in response", http.StatusInternalServerError)
 		return
 	}
+	callInfoRow := callInfoWrapper.Rows[matched]
 
 	// Enrich call_info with channel-only fields so it matches the /v1/calls
 	// list response shape. Non-fatal on error: the rest of the response still
@@ -929,11 +956,11 @@ func (h *APIHandler) GetCallDetails(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if ch, ok := channelsByUUID[aLegUUID]; ok {
-				enrichCallWithChannel(callInfoWrapper.Rows[0], ch, false)
+				enrichCallWithChannel(callInfoRow, ch, false)
 			}
 			if bLegUUID != "" {
 				if ch, ok := channelsByUUID[bLegUUID]; ok {
-					enrichCallWithChannel(callInfoWrapper.Rows[0], ch, true)
+					enrichCallWithChannel(callInfoRow, ch, true)
 				}
 			}
 		}
@@ -952,7 +979,7 @@ func (h *APIHandler) GetCallDetails(w http.ResponseWriter, r *http.Request) {
 	responseJSON.WriteString(`{"status":"success","call_info":`)
 
 	// Just use call_info as-is from FreeSWITCH (preserves their ordering)
-	callInfoJSON, _ := json.Marshal(callInfoWrapper.Rows[0])
+	callInfoJSON, _ := json.Marshal(callInfoRow)
 	responseJSON.Write(callInfoJSON)
 
 	responseJSON.WriteString(`,"aleg":{"uuid":"`)
@@ -1154,61 +1181,11 @@ func (h *APIHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// sanitizeDialDestination keeps only FreeSWITCH-safe dial characters (digits, +, *, #).
-// Defense-in-depth: the destination is interpolated into an `api conference … bgdial`
-// command, so any whitespace/quoting that could inject extra arguments is stripped. Returns
-// "" when nothing dialable remains or the value is over-long.
-func sanitizeDialDestination(raw string) string {
-	var b strings.Builder
-	for _, c := range raw {
-		if (c >= '0' && c <= '9') || c == '+' || c == '*' || c == '#' {
-			b.WriteRune(c)
-		}
-	}
-	s := b.String()
-	if len(s) == 0 || len(s) > 20 {
-		return ""
-	}
-	return s
-}
-
-// channelVar fetches a single channel variable, trimmed. Returns ("", nil) when the variable
-// is simply unset (FreeSWITCH "_undef_"), and a non-nil error on an ESL/command failure or a
-// FreeSWITCH "-ERR" (e.g. the channel is gone). Callers MUST distinguish "not set" from
-// "couldn't read" — for conference_name/bridge_uuid, treating a read error as "not conferenced"
-// would tear a live bridge or skip the partner move (SP-L12).
-func (h *APIHandler) channelVar(uuid, name string) (string, error) {
-	resp, err := h.eslClient.SendCommand(fmt.Sprintf("api uuid_getvar %s %s", uuid, name))
-	if err != nil {
-		return "", err
-	}
-	v := strings.TrimSpace(resp)
-	if strings.HasPrefix(v, "-ERR") {
-		return "", fmt.Errorf("uuid_getvar %s %s failed: %s", uuid, name, v)
-	}
-	if v == "_undef_" {
-		return "", nil
-	}
-	return v, nil
-}
-
-// sanitizeTollAllow keeps only characters valid in a toll_allow class list (alphanumerics,
-// comma, underscore, dash) so the value can't break out of the channel-variable syntax it's
-// interpolated into.
-func sanitizeTollAllow(raw string) string {
-	var b strings.Builder
-	for _, c := range raw {
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ',' || c == '_' || c == '-' {
-			b.WriteRune(c)
-		}
-	}
-	return b.String()
-}
-
 // waitForConferenceJoin polls until every leg reports it has joined `room`. mod_conference sets
 // the channel variable conference_name on a member only AFTER the async join completes, so a
 // single immediate read races it; this polls (~150ms × 30 ≈ 4.5s budget) and returns true once
 // all legs are in, or false if the join never completes (profile missing/disabled, leg dropped).
+// Each read is the leg's own uuid_dump on the serialized connection.
 func (h *APIHandler) waitForConferenceJoin(legs []string, room string) bool {
 	const attempts = 30
 	const interval = 150 * time.Millisecond
@@ -1218,8 +1195,8 @@ func (h *APIHandler) waitForConferenceJoin(legs []string, room string) bool {
 		}
 		allJoined := true
 		for _, leg := range legs {
-			name, err := h.channelVar(leg, "conference_name")
-			if err != nil || name != room {
+			info, err := h.getCallContext(leg)
+			if err != nil || !info.Found || info.ConferenceName != room {
 				allJoined = false
 				break
 			}
@@ -1263,8 +1240,9 @@ func sanitizeCallerIDNumber(raw string) string {
 // carrier from the number anyway.
 func buildConferenceDialString(tollAllow, cidNum, context, dest string) string {
 	var vars, exports []string
-	if t := sanitizeTollAllow(tollAllow); t != "" {
-		vars = append(vars, "toll_allow="+t)
+	// tollAllow is already matched against tollAllowPattern (AddToConference).
+	if tollAllow != "" {
+		vars = append(vars, "toll_allow="+tollAllow)
 		exports = append(exports, "toll_allow")
 	}
 	if n := sanitizeCallerIDNumber(cidNum); n != "" {
@@ -1317,15 +1295,22 @@ func (h *APIHandler) AddToConference(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dest := sanitizeDialDestination(req.Destination)
-	if dest == "" {
-		h.respondError(w, r, "destination is required", http.StatusBadRequest)
+	dest := req.Destination
+	if !conferenceTargetPattern.MatchString(dest) {
+		h.respondError(w, r, "destination must be an extension or number (digits, +, * and #)", http.StatusBadRequest)
+		return
+	}
+	// U61: the toll classes come from the server (the softphone reads them from the
+	// caller's own extension); a value outside the class-list shape is refused, not trimmed.
+	tollAllow := normalizeTollAllow(req.TollAllow)
+	if tollAllow != "" && !tollAllowPattern.MatchString(tollAllow) {
+		h.respondError(w, r, "tollAllow must be a comma-separated list of toll class names", http.StatusBadRequest)
 		return
 	}
 
 	// SP-L13: the loopback dial routes in the call's domain context (AccountCode). An empty
-	// context would dial in the wrong/no context — refuse rather than dial blindly.
-	if strings.TrimSpace(callInfo.AccountCode) == "" {
+	// or malformed context would dial in the wrong/no context — refuse rather than dial blindly.
+	if !domainNamePattern.MatchString(callInfo.AccountCode) {
 		h.respondError(w, r, "Call has no resolvable domain context", http.StatusBadGateway)
 		return
 	}
@@ -1337,7 +1322,7 @@ func (h *APIHandler) AddToConference(w http.ResponseWriter, r *http.Request) {
 	// out as the conference placeholder 0000000000 — which carriers reject (503). Best-effort:
 	// empty just falls back to prior behavior. Read before the transfers (var persists, but the
 	// controlling leg is unambiguous here).
-	outboundCid, _ := h.channelVar(callUUID, "outbound_caller_id_number")
+	outboundCid := callInfo.OutboundCallerIDNumber
 
 	// Silent ad-hoc conference profile (FusionPBX DB profile "softphone": no enter/exit tones, no
 	// "you are the only person" announcement, no MOH, no comfort noise) so a merge is seamless.
@@ -1346,23 +1331,39 @@ func (h *APIHandler) AddToConference(w http.ResponseWriter, r *http.Request) {
 
 	// If the call is already in a conference, reuse that room; otherwise move the live bridge
 	// into a new per-call room. A getvar error here is NOT "not conferenced" — fail fast (SP-L12).
-	existing, err := h.channelVar(callUUID, "conference_name")
-	if err != nil {
-		h.respondError(w, r, fmt.Sprintf("Failed to read call state: %v", err), http.StatusBadGateway)
-		return
-	}
+	existing := callInfo.ConferenceName
 	if existing != "" {
+		// Only fs-api's own ad-hoc rooms (sp-<call uuid>) are reused: another
+		// conference the call joined may be another tenant's room.
+		if !conferenceRoomPattern.MatchString(existing) {
+			h.respondError(w, r, "Call is in a conference fs-api didn't start; participants can't be added to it here", http.StatusConflict)
+			return
+		}
 		room = existing
 	} else {
 		// Resolve the bridge partner explicitly (see the -both caveat in the doc comment). An
 		// empty partner is valid — a single, unbridged leg — not an error.
-		partner, perr := h.channelVar(callUUID, "bridge_uuid")
-		if perr != nil {
-			h.respondError(w, r, fmt.Sprintf("Failed to read call state: %v", perr), http.StatusBadGateway)
-			return
-		}
+		partner := callInfo.BridgeUUID
 		legs := []string{callUUID}
 		if partner != "" {
+			if !canonicalUUID.MatchString(partner) {
+				h.respondError(w, r, "Call's bridged leg has an unexpected id", http.StatusBadGateway)
+				return
+			}
+			// The partner is moved into this caller's room: it must be a leg of the same tenant.
+			partnerInfo, perr := h.getCallContext(partner)
+			if perr != nil {
+				h.respondError(w, r, fmt.Sprintf("Failed to read call state: %v", perr), http.StatusBadGateway)
+				return
+			}
+			if !partnerInfo.Found {
+				h.respondError(w, r, "Call's bridged leg has ended", http.StatusConflict)
+				return
+			}
+			if !sameTenant(callInfo, partnerInfo) {
+				h.respondError(w, r, "Call's bridged leg is not in this call's context", http.StatusForbidden)
+				return
+			}
 			legs = append(legs, partner)
 		}
 
@@ -1394,7 +1395,7 @@ func (h *APIHandler) AddToConference(w http.ResponseWriter, r *http.Request) {
 
 	// SP-H2: forward the originating extension's toll_allow (so the dialplan gates the loopback
 	// dial like a normal outbound call) + its outbound caller-ID DID (so the carrier accepts it).
-	dialString := buildConferenceDialString(req.TollAllow, outboundCid, callInfo.AccountCode, dest)
+	dialString := buildConferenceDialString(tollAllow, outboundCid, callInfo.AccountCode, dest)
 	if _, err := h.eslClient.SendCommand(fmt.Sprintf("api conference %s bgdial %s", room, dialString)); err != nil {
 		h.respondError(w, r, fmt.Sprintf("Failed to add participant: %v", err), h.getErrorStatusCode(err))
 		return

@@ -2,49 +2,6 @@ package main
 
 import "testing"
 
-func TestSanitizeDialDestination(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"plain extension", "200", "200"},
-		{"e164", "+15146272886", "+15146272886"},
-		{"feature code", "*97", "*97"},
-		{"strips formatting", "(514) 627-2886", "5146272886"},
-		{"strips injection flags", "200 -both &exec", "200"},
-		{"strips shell", "200;rm -rf /", "200"},
-		{"non-dialable", "abc", ""},
-		{"empty", "", ""},
-		{"over-long rejected", "123456789012345678901", ""}, // 21 chars > 20
-		{"max length kept", "12345678901234567890", "12345678901234567890"},
-	}
-	for _, c := range cases {
-		if got := sanitizeDialDestination(c.in); got != c.want {
-			t.Errorf("%s: sanitizeDialDestination(%q) = %q, want %q", c.name, c.in, got, c.want)
-		}
-	}
-}
-
-func TestSanitizeTollAllow(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"classes with commas", "domestic,international,local", "domestic,international,local"},
-		{"keeps underscore/dash", "us_48,intl-premium", "us_48,intl-premium"},
-		{"strips delimiter chars", "domestic:bad]inject}x", "domesticbadinjectx"},
-		{"strips spaces/quotes", "domestic, 'evil'", "domestic,evil"},
-		{"empty", "", ""},
-	}
-	for _, c := range cases {
-		if got := sanitizeTollAllow(c.in); got != c.want {
-			t.Errorf("%s: sanitizeTollAllow(%q) = %q, want %q", c.name, c.in, got, c.want)
-		}
-	}
-}
-
 func TestBuildConferenceDialString(t *testing.T) {
 	const ctx = "f1-dev.emaktech.com"
 
@@ -65,9 +22,9 @@ func TestBuildConferenceDialString(t *testing.T) {
 		t.Errorf("external: got %q, want %q", got, want)
 	}
 
-	// Injection chars are sanitized out of both values.
-	want = "[^^:loopback_export=toll_allow,outbound_caller_id_number:toll_allow=domesticevil:outbound_caller_id_number=15551234]loopback/200/f1-dev.emaktech.com"
-	if got := buildConferenceDialString("domestic]evil", "1 555-1234 ;rm", ctx, "200"); got != want {
+	// The caller ID number, read from the call, is reduced to digits and +.
+	want = "[^^:loopback_export=outbound_caller_id_number:outbound_caller_id_number=15551234]loopback/200/f1-dev.emaktech.com"
+	if got := buildConferenceDialString("", "1 555-1234 x", ctx, "200"); got != want {
 		t.Errorf("sanitized: got %q", got)
 	}
 }

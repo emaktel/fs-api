@@ -19,17 +19,16 @@ import (
 	"github.com/percipia/eslgo"
 )
 
-// CallRegistration tracks an originated call and where to send its events.
+// CallRegistration tracks an originated call and who its events go to.
 type CallRegistration struct {
-	CallUUID    string `json:"call_uuid"`
-	UserUUID    string `json:"user_uuid"`
-	DomainUUID  string `json:"domain_uuid"`
-	DomainName  string `json:"domain_name"`
-	CallbackURL string `json:"callback_url,omitempty"`
-	CreatedAt   time.Time
+	CallUUID   string `json:"call_uuid"`
+	UserUUID   string `json:"user_uuid"`
+	DomainUUID string `json:"domain_uuid"`
+	DomainName string `json:"domain_name"`
+	CreatedAt  time.Time
 }
 
-// CallEvent is the payload forwarded to the WebSocket worker and/or callback URL.
+// CallEvent is the payload forwarded to the WebSocket worker.
 type CallEvent struct {
 	CallUUID          string `json:"call_uuid"`
 	Event             string `json:"event"`
@@ -438,10 +437,6 @@ func (es *EventSubscriber) handleEvent(event *eslgo.Event) {
 
 	go es.broadcastEvent(reg, callEvent)
 
-	if reg.CallbackURL != "" {
-		go es.callWebhook(reg.CallbackURL, callEvent)
-	}
-
 	if eventName == "CHANNEL_DESTROY" {
 		es.UnregisterCall(callUUID)
 	}
@@ -532,27 +527,6 @@ func (es *EventSubscriber) broadcastEvent(reg *CallRegistration, event CallEvent
 	if err := es.sendBroadcast("call_event", payload); err != nil {
 		log.Printf("[Events] Broadcast failed: %v", err)
 	}
-}
-
-func (es *EventSubscriber) callWebhook(callbackURL string, event CallEvent) {
-	body, err := json.Marshal(event)
-	if err != nil {
-		return
-	}
-
-	req, err := http.NewRequest("POST", callbackURL, bytes.NewReader(body))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("[Events] Webhook to %s failed: %v", callbackURL, err)
-		return
-	}
-	defer resp.Body.Close()
 }
 
 // handleExtensionRing fires when a b-leg is created to ring a specific extension.

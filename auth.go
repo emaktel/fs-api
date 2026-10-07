@@ -20,11 +20,17 @@ type contextAuth struct {
 	Unrestricted bool
 }
 
-// CallContextInfo contains call context information from FreeSWITCH
+// CallContextInfo contains call context information from FreeSWITCH, read
+// from the call's own uuid_dump on the serialized connection.
 type CallContextInfo struct {
 	UUID        string
 	AccountCode string
 	Found       bool
+	// Channel variables AddToConference needs; "" when unset.
+	DomainName             string
+	ConferenceName         string
+	BridgeUUID             string
+	OutboundCallerIDNumber string
 }
 
 // isUnrestrictedAccess checks if the request has unrestricted context access
@@ -68,7 +74,12 @@ func (h *APIHandler) getCallContext(callUUID string) (*CallContextInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to retrieve call: %v", err)
 	}
+	return contextFromDump(callUUID, dumpData), nil
+}
 
+// contextFromDump reads a call's tenant and the variables fs-api needs from
+// its uuid_dump.
+func contextFromDump(callUUID string, dumpData map[string]any) *CallContextInfo {
 	// Determine context: prefer variable_accountcode, then Caller-Context, then variable_domain_name
 	callContext := ""
 	if v, ok := dumpData["variable_accountcode"].(string); ok && v != "" {
@@ -79,80 +90,56 @@ func (h *APIHandler) getCallContext(callUUID string) (*CallContextInfo, error) {
 		callContext = v
 	}
 
+	str := func(key string) string {
+		v, _ := dumpData[key].(string)
+		return strings.TrimSpace(v)
+	}
 	return &CallContextInfo{
-		UUID:        callUUID,
-		AccountCode: callContext,
-		Found:       true,
-	}, nil
+		UUID:                   callUUID,
+		AccountCode:            callContext,
+		Found:                  true,
+		DomainName:             str("variable_domain_name"),
+		ConferenceName:         str("variable_conference_name"),
+		BridgeUUID:             str("variable_bridge_uuid"),
+		OutboundCallerIDNumber: str("variable_outbound_caller_id_number"),
+	}
 }
 
 // validateCallContext validates that a call belongs to an allowed context
 // Returns the call context info and true if valid, or responds with error and returns false
 func (h *APIHandler) validateCallContext(w http.ResponseWriter, r *http.Request, callUUID string) (*CallContextInfo, bool) {
-	// Check if unrestricted access
-	if isUnrestrictedAccess(r) {
-		// Still verify call exists for proper 404
-		callInfo, err := h.getCallContext(callUUID)
-		if err != nil {
-			h.respondError(w, r, fmt.Sprintf("Failed to verify call: %v", err), http.StatusInternalServerError)
-			return nil, false
-		}
-		if !callInfo.Found {
-			h.respondError(w, r, fmt.Sprintf("Call %s not found", callUUID), http.StatusNotFound)
-			return nil, false
-		}
-		return callInfo, true
-	}
-
-	allowedContexts := getAllowedContexts(r)
-
-	// Fetch call context
 	callInfo, err := h.getCallContext(callUUID)
 	if err != nil {
 		h.respondError(w, r, fmt.Sprintf("Failed to verify call context: %v", err), http.StatusInternalServerError)
 		return nil, false
 	}
-
 	if !callInfo.Found {
 		h.respondError(w, r, fmt.Sprintf("Call %s not found", callUUID), http.StatusNotFound)
 		return nil, false
 	}
-
-	// Check if call context is allowed
-	for _, allowed := range allowedContexts {
-		if callInfo.AccountCode == allowed {
-			return callInfo, true
-		}
+	if !contextAllowed(r, callInfo.AccountCode) {
+		h.respondError(w, r,
+			fmt.Sprintf("Call %s belongs to context '%s' which is not in your allowed contexts: [%s]",
+				callUUID, callInfo.AccountCode, strings.Join(getAllowedContexts(r), ", ")),
+			http.StatusForbidden)
+		return nil, false
 	}
+	return callInfo, true
+}
 
-	// Context not allowed
-	allowedList := strings.Join(allowedContexts, ", ")
-	h.respondError(w, r,
-		fmt.Sprintf("Call %s belongs to context '%s' which is not in your allowed contexts: [%s]",
-			callUUID, callInfo.AccountCode, allowedList),
-		http.StatusForbidden)
-	return nil, false
+// sameTenant: two legs of one tenant share its accountcode, or (for an
+// extension with its own accountcode) its domain_name.
+func sameTenant(a, b *CallContextInfo) bool {
+	return a.AccountCode == b.AccountCode || (a.DomainName != "" && a.DomainName == b.DomainName)
 }
 
 // validateRequestContext validates a context specified in the request body
 // Returns true if valid, or responds with error and returns false
 func (h *APIHandler) validateRequestContext(w http.ResponseWriter, r *http.Request, requestContext string) bool {
-	// Check if unrestricted access
-	if isUnrestrictedAccess(r) {
+	if contextAllowed(r, requestContext) {
 		return true
 	}
-
-	allowedContexts := getAllowedContexts(r)
-
-	// Check if request context is allowed
-	for _, allowed := range allowedContexts {
-		if requestContext == allowed {
-			return true
-		}
-	}
-
-	// Context not allowed
-	allowedList := strings.Join(allowedContexts, ", ")
+	allowedList := strings.Join(getAllowedContexts(r), ", ")
 	h.respondError(w, r,
 		fmt.Sprintf("Cannot originate call in context '%s' - not in your allowed contexts: [%s]",
 			requestContext, allowedList),

@@ -2,20 +2,17 @@ package main
 
 // Callcenter request types
 
+// AgentAddRequest and AgentSetRequest: callers also send a `domain` field,
+// which is ignored. An agent's tenant comes from its name or contact
+// (agentOwner), never from the request.
 type AgentAddRequest struct {
-	Name   string `json:"name"`   // UUID
-	Type   string `json:"type"`   // callback or uuid-standby
-	Domain string `json:"domain"` // for auth validation
+	Name string `json:"name"` // the FusionPBX agent uuid, or <name>@<domain>
+	Type string `json:"type"` // callback or uuid-standby
 }
 
 type AgentSetRequest struct {
-	Key    string `json:"key"`
-	Value  string `json:"value"`
-	Domain string `json:"domain"` // for auth validation
-}
-
-type AgentDelRequest struct {
-	Domain string `json:"domain"` // for auth validation
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
 type TierAddRequest struct {
@@ -48,24 +45,4 @@ type CCListResponse struct {
 type CCCountResponse struct {
 	Status string `json:"status"`
 	Count  int    `json:"count"`
-}
-
-// Validation maps for allowed set keys
-
-var validAgentSetKeys = map[string]bool{
-	"status":           true,
-	"state":            true,
-	"contact":          true,
-	"type":             true,
-	"max_no_answer":    true,
-	"wrap_up_time":     true,
-	"reject_delay_time": true,
-	"busy_delay_time":  true,
-	"ready_time":       true,
-}
-
-var validTierSetKeys = map[string]bool{
-	"state":    true,
-	"level":    true,
-	"position": true,
 }

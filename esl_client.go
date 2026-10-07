@@ -31,8 +31,9 @@ var canonicalUUID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-
 const maxESLBody = 1 << 20
 
 // eslSerialClient is an ESL client on its own connection that runs one
-// command at a time, for the commands whose reply decides who a call belongs
-// to (`uuid_dump` for call authorization and call details).
+// command at a time, for the commands whose reply decides who a call or an
+// agent belongs to (`uuid_dump` for call authorization and call details,
+// `callcenter_config agent list` and `agent add` for agent ownership).
 //
 // eslgo does not match replies to requests (any waiter takes the next reply),
 // and a timed-out caller leaves its late reply for the next one. Here one
@@ -96,25 +97,8 @@ func (c *eslSerialClient) ChannelDump(ctx context.Context, callUUID string) (map
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// A caller that waited out its deadline for the lock leaves the connection alone.
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	cmd := "uuid_dump " + callUUID + " json"
-	reused := c.conn != nil
-	body, err := c.apiLocked(ctx, cmd)
-	var stale *staleConnError
-	if err != nil && reused && errors.As(err, &stale) && ctx.Err() == nil {
-		// A reused connection that FreeSWITCH dropped while idle (e.g. its
-		// weekly restart): redial and retry once. The Unique-ID check still
-		// applies to the retried reply.
-		log.Printf("[ESL] Serialized connection was stale (%v); redialing once", err)
-		c.closeLocked()
-		body, err = c.apiLocked(ctx, cmd)
-	}
+	body, err := c.runLocked(ctx, "uuid_dump "+callUUID+" json")
 	if err != nil {
-		c.closeLocked()
 		return nil, err
 	}
 	dump, err := parseChannelDump(body, callUUID)
@@ -123,6 +107,52 @@ func (c *eslSerialClient) ChannelDump(ctx context.Context, callUUID string) (map
 		c.closeLocked()
 	}
 	return dump, err
+}
+
+// API runs one api command whose reply decides who something belongs to
+// (the agent list behind agent ownership, the agent add behind a claim); the
+// reply is this command's. mod_callcenter's "-ERR ..." reply is an error.
+func (c *eslSerialClient) API(ctx context.Context, cmd string) (string, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		return "", errors.New("serialized api command without a deadline")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	body, err := c.runLocked(ctx, cmd)
+	if err != nil {
+		return "", err
+	}
+	reply := string(body)
+	if strings.HasPrefix(strings.TrimSpace(reply), "-ERR") {
+		return "", fmt.Errorf("ESL error: %s", strings.TrimSpace(reply))
+	}
+	return reply, nil
+}
+
+// runLocked runs one api command, redialing once when a reused connection
+// turns out to have been dropped while idle, and closes the connection on
+// any failure. c.mu must be held.
+func (c *eslSerialClient) runLocked(ctx context.Context, cmd string) ([]byte, error) {
+	// A caller that waited out its deadline for the lock leaves the connection alone.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	reused := c.conn != nil
+	body, err := c.apiLocked(ctx, cmd)
+	var stale *staleConnError
+	if err != nil && reused && errors.As(err, &stale) && ctx.Err() == nil {
+		// A reused connection that FreeSWITCH dropped while idle (e.g. its
+		// weekly restart): redial and retry once. The caller's own checks
+		// still apply to the retried reply.
+		log.Printf("[ESL] Serialized connection was stale (%v); redialing once", err)
+		c.closeLocked()
+		body, err = c.apiLocked(ctx, cmd)
+	}
+	if err != nil {
+		c.closeLocked()
+		return nil, err
+	}
+	return body, nil
 }
 
 // Close closes the connection (shutdown); a later command would redial.
