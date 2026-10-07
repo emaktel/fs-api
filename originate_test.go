@@ -130,7 +130,7 @@ func TestOriginateRegistersTheAnsweringForkLeg(t *testing.T) {
 		t.Fatalf("registry = %+v", registeredCalls(es))
 	}
 	cmds := fs.commands()
-	if len(cmds) != 2 || strings.Contains(cmds[1], "origination_uuid") || cmds[1] != "1:api originate user/101@acme.example.com &park()" {
+	if len(cmds) != 2 || strings.Contains(cmds[1], "origination_uuid") || cmds[1] != "1:api originate user/101@acme.example.com &park() undef undef undef undef 60" {
 		t.Fatalf("commands = %q", cmds)
 	}
 }
@@ -146,7 +146,7 @@ func TestOriginatePassesCallerOriginationUUIDThrough(t *testing.T) {
 	if rec.Code != http.StatusOK || registeredCalls(es)[fxCallX] == nil {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
-	if cmd := fs.commands()[1]; cmd != "1:api originate {origination_uuid="+fxCallX+"}user/101@acme.example.com &park()" {
+	if cmd := fs.commands()[1]; cmd != "1:api originate {origination_uuid="+fxCallX+"}user/101@acme.example.com &park() undef undef undef undef 60" {
 		t.Fatalf("command %q", cmd)
 	}
 }
@@ -318,11 +318,60 @@ func TestOriginateTimeoutBounds(t *testing.T) {
 	}
 }
 
-// The longest accepted ring time still fits the server's WriteTimeout.
-func TestOriginateDeadlineFitsWriteTimeout(t *testing.T) {
-	for _, d := range []time.Duration{time.Duration(maxOriginateTimeoutSec) * time.Second, defaultOriginateTimeout} {
-		if d+originateReplyMargin >= serverWriteTimeout {
-			t.Fatalf("originate deadline %s is not under the %s WriteTimeout", d+originateReplyMargin, serverWriteTimeout)
+// The deadline always outlasts the ring timeout FreeSWITCH was given, and the
+// longest one still fits the server's WriteTimeout.
+func TestOriginateDeadline(t *testing.T) {
+	for _, requested := range []int{0, 1, 30, maxOriginateTimeoutSec} {
+		ring := originateTimeoutSec(requested)
+		if requested == 0 && ring != 60 {
+			t.Fatalf("no timeout_sec must send FreeSWITCH's default 60, got %d", ring)
 		}
+		d := originateDeadline(ring)
+		if d <= time.Duration(ring)*time.Second {
+			t.Fatalf("deadline %s does not outlast the %d s ring timeout", d, ring)
+		}
+		if d >= serverWriteTimeout {
+			t.Fatalf("deadline %s is not under the %s WriteTimeout", d, serverWriteTimeout)
+		}
+	}
+}
+
+// The exact command for every combination of optional arguments. FreeSWITCH
+// reads originate's optional arguments by position, with "undef" for a
+// skipped slot, so every slot is written and the ring timeout is always the
+// seventh argument (U48: {aleg, timeout_sec:10} used to send
+// "... &park() 10", which FreeSWITCH read as the dialplan, ringing 60 s).
+func TestOriginateCommandArguments(t *testing.T) {
+	const aleg = "user/101@acme.example.com"
+	for _, tc := range []struct {
+		name string
+		body map[string]any
+		want string
+	}{
+		{"none", map[string]any{"aleg": aleg},
+			"originate user/101@acme.example.com &park() undef undef undef undef 60"},
+		{"timeout only", map[string]any{"aleg": aleg, "timeout_sec": 10},
+			"originate user/101@acme.example.com &park() undef undef undef undef 10"},
+		{"context only", map[string]any{"aleg": aleg, "context": "acme.example.com"},
+			"originate user/101@acme.example.com &park() undef acme.example.com undef undef 60"},
+		{"dialplan only", map[string]any{"aleg": aleg, "dialplan": "XML"},
+			"originate user/101@acme.example.com &park() XML undef undef undef 60"},
+		{"cid only", map[string]any{"aleg": aleg, "caller_id_name": "Front Desk", "caller_id_number": "5145550100"},
+			"originate {origination_caller_id_number=5145550100,origination_caller_id_name='Front Desk'}user/101@acme.example.com &park() undef undef undef undef 60"},
+		{"all", map[string]any{"aleg": aleg, "bleg": "5145550199", "dialplan": "XML", "context": "acme.example.com",
+			"caller_id_name": "Front Desk", "caller_id_number": "5145550100", "timeout_sec": 25},
+			"originate {origination_caller_id_number=5145550100,origination_caller_id_name='Front Desk'}user/101@acme.example.com 5145550199 XML acme.example.com undef undef 25"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := newFakeFreeSWITCH(t, "ClueCon-test", replyWith("+OK "+fxCallX+"\n"))
+			h, _ := originateHandlerFor(fs)
+			if rec := originate(t, h, fxUser1, fxDomainA, tc.body); rec.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body)
+			}
+			cmds := fs.commands()
+			if len(cmds) != 2 || cmds[1] != "1:api "+tc.want {
+				t.Fatalf("command\n got: %q\nwant: %q", cmds, "1:api "+tc.want)
+			}
+		})
 	}
 }

@@ -466,15 +466,39 @@ func (h *APIHandler) ParkCall(w http.ResponseWriter, r *http.Request) {
 }
 
 // Originate runs on its own ESL connection, held for the whole ring time.
-// defaultOriginateTimeout is FreeSWITCH's originate_timeout default;
-// originateReplyMargin covers dialing and the reply on top of it.
-// maxOriginateTimeoutSec keeps the originate deadline (timeout + margin)
-// under serverWriteTimeout, so the reply always reaches the caller.
+// defaultOriginateTimeoutSec is FreeSWITCH's own originate default, sent
+// explicitly when the request has no timeout_sec; originateReplyMargin covers
+// dialing and the reply on top of the ring time. maxOriginateTimeoutSec keeps
+// the deadline (timeout + margin) under serverWriteTimeout, so the reply
+// always reaches the caller.
 const (
-	defaultOriginateTimeout = 60 * time.Second
-	originateReplyMargin    = 30 * time.Second
-	maxOriginateTimeoutSec  = 85
+	defaultOriginateTimeoutSec = 60
+	originateReplyMargin       = 30 * time.Second
+	maxOriginateTimeoutSec     = 85
 )
+
+// originateTimeoutSec is the ring timeout written into the originate command.
+func originateTimeoutSec(requested int) int {
+	if requested > 0 {
+		return requested
+	}
+	return defaultOriginateTimeoutSec
+}
+
+// originateDeadline bounds the whole originate exchange: always longer than
+// the ring timeout FreeSWITCH was given.
+func originateDeadline(ringTimeoutSec int) time.Duration {
+	return time.Duration(ringTimeoutSec)*time.Second + originateReplyMargin
+}
+
+// orUndef is an originate positional argument: the value, or "undef" for an
+// absent slot.
+func orUndef(v string) string {
+	if v == "" {
+		return "undef"
+	}
+	return v
+}
 
 // maxConcurrentOriginates caps in-flight originates per box: each holds a TCP
 // connection, a FreeSWITCH listener thread and a goroutine for up to the whole
@@ -555,53 +579,18 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 		channelVars = fmt.Sprintf("{%s}", strings.Join(vars, ","))
 	}
 
-	// Build the originate command: originate {vars}aleg bleg [dialplan] [context] [cid_name] [cid_num] [timeout]
+	// Build the originate command. FreeSWITCH reads originate's optional
+	// arguments by position (mod_commands.c originate_function:
+	// <url> <exten> [<dialplan>] [<context>] [<cid_name>] [<cid_num>] [<timeout_sec>])
+	// and treats "undef" as an absent slot (dialplan XML, context default,
+	// no caller ID). Every slot is written, so the ring timeout is always the
+	// seventh argument and FreeSWITCH gives up exactly when this handler's
+	// deadline expects. Caller ID is sent as origination_caller_id_* channel
+	// variables (above), so its two slots are always undef.
+	ringTimeoutSec := originateTimeoutSec(req.TimeoutSec)
 	var cmd strings.Builder
-	cmd.WriteString("originate ")
-
-	// Add channel variables if present
-	if channelVars != "" {
-		cmd.WriteString(channelVars)
-	}
-
-	// Add A-leg
-	cmd.WriteString(req.ALeg)
-	cmd.WriteString(" ")
-
-	// Add B-leg (can be extension or &application)
-	cmd.WriteString(req.BLeg)
-
-	// Add optional parameters in order: dialplan, context, cid_name, cid_num, timeout
-	// Note: When using channel variables for caller ID (origination_caller_id_*),
-	// we include them here only if NOT already in the channel variables
-
-	if req.Dialplan != "" {
-		cmd.WriteString(" ")
-		cmd.WriteString(req.Dialplan)
-	}
-
-	if req.Context != "" {
-		cmd.WriteString(" ")
-		cmd.WriteString(req.Context)
-	}
-
-	// Add cid_name or skip it
-	if req.CallerIDName != "" && !strings.Contains(channelVars, "origination_caller_id_name") {
-		cmd.WriteString(" ")
-		cmd.WriteString(req.CallerIDName)
-	}
-
-	// Add cid_num or skip it
-	if req.CallerIDNumber != "" && !strings.Contains(channelVars, "origination_caller_id_number") {
-		cmd.WriteString(" ")
-		cmd.WriteString(req.CallerIDNumber)
-	}
-
-	// Add timeout if specified
-	if req.TimeoutSec > 0 {
-		cmd.WriteString(" ")
-		cmd.WriteString(fmt.Sprintf("%d", req.TimeoutSec))
-	}
+	fmt.Fprintf(&cmd, "originate %s%s %s %s %s undef undef %d",
+		channelVars, req.ALeg, req.BLeg, orUndef(req.Dialplan), orUndef(req.Context), ringTimeoutSec)
 
 	// Send the originate on its own ESL connection. The shared connection does
 	// not match replies to requests, so a uuid read from its reply could be
@@ -619,11 +608,7 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	timeout := defaultOriginateTimeout
-	if req.TimeoutSec > 0 {
-		timeout = time.Duration(req.TimeoutSec) * time.Second
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout+originateReplyMargin)
+	ctx, cancel := context.WithTimeout(context.Background(), originateDeadline(ringTimeoutSec))
 	defer cancel()
 	logInfo(requestID, "ESL Command: api "+cmd.String())
 	reply, err := h.originateESL.API(ctx, cmd.String())
