@@ -148,7 +148,7 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	log.Printf("Server configured with ReadTimeout: 15s, WriteTimeout: 15s, IdleTimeout: 60s")
+	log.Printf("Server configured with ReadTimeout: %s, WriteTimeout: %s, IdleTimeout: %s", srv.ReadTimeout, srv.WriteTimeout, srv.IdleTimeout)
 
 	// Start event subscriber in background
 	eventsCtx, eventsCancel := context.WithCancel(context.Background())
