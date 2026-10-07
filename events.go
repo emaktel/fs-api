@@ -116,10 +116,19 @@ type resolvedUser struct {
 	domainUuid string
 }
 
-// userCacheEntry holds resolved extension → users mapping with TTL.
+// userCacheEntry holds resolved extension → users mapping.
 type userCacheEntry struct {
 	users      []resolvedUser
 	resolvedAt time.Time
+}
+
+// callLookup is one extension's lookup for one call (a-leg). The call's b-legs share it
+// and no other call reads it (Loi 5 U32). ready is closed once resolved is set, so b-legs
+// arriving while the lookup is in flight wait for it instead of all asking the database.
+type callLookup struct {
+	ready     chan struct{}
+	resolved  *userCacheEntry
+	startedAt time.Time
 }
 
 // EventSubscriber manages ESL event subscription and call event forwarding.
@@ -138,8 +147,8 @@ type EventSubscriber struct {
 	mu       sync.RWMutex
 	registry map[string]*CallRegistration // call_uuid -> registration
 
-	userCacheMu sync.RWMutex
-	userCache   map[string]*userCacheEntry // "domain:extension" -> resolved user
+	userCacheMu sync.Mutex
+	userCache   map[string]*callLookup // "aleg_uuid:domain:extension" -> that call's lookup
 
 	// ringRegistry tracks b-leg call UUIDs so we can forward answer/hangup events
 	// to the correct user. Populated on successful ring broadcast, cleaned up on CHANNEL_DESTROY.
@@ -190,7 +199,7 @@ func NewEventSubscriber(cfg EventSubscriberConfig) *EventSubscriber {
 		resolveURL:      cfg.ResolveURL,
 		resolveSecret:   cfg.ResolveSecret,
 		registry:        make(map[string]*CallRegistration),
-		userCache:       make(map[string]*userCacheEntry),
+		userCache:       make(map[string]*callLookup),
 		ringRegistry:    make(map[string]*ringRegistration),
 		seenRing:        make(map[string]time.Time),
 		eventProbe:      defaultEventProbe,
@@ -565,7 +574,7 @@ func (es *EventSubscriber) handleExtensionRing(event *eslgo.Event, callUUID, dom
 
 	log.Printf("[Events] Extension ring: %s → %s@%s (call %s, a-leg %s)", callerIDNumber, extension, domainName, callUUID, alegUUID)
 
-	resolved := es.resolveUser(extension, domainName)
+	resolved := es.resolveUserForCall(alegUUID, extension, domainName)
 	if resolved == nil || len(resolved.users) == 0 {
 		return
 	}
@@ -665,20 +674,44 @@ func (es *EventSubscriber) broadcastCallState(t tenantRecipients, data CallState
 	}
 }
 
-const userCacheTTL = 5 * time.Minute
-
-// resolveUser looks up the user for an extension via the configured resolve endpoint.
-// Results are cached to avoid per-call HTTP requests.
-func (es *EventSubscriber) resolveUser(extension, domainName string) *userCacheEntry {
-	cacheKey := domainName + ":" + extension
-
-	es.userCacheMu.RLock()
-	if entry, ok := es.userCache[cacheKey]; ok && time.Since(entry.resolvedAt) < userCacheTTL {
-		es.userCacheMu.RUnlock()
-		return entry
+// resolveUserForCall returns the users an extension rings for one call. The lookup is
+// shared by that call's b-legs (one per registered device, retries, ring-group legs) and by
+// nothing else: every new call asks the database again, so an extension moved to another
+// user — in the app, the PHP portal, KAI or SQL — stops ringing its former owner from the
+// next call on, give or take the read replica's lag. Concurrent b-legs wait for the first
+// one's lookup. A lookup that found no user (or failed) is not kept, so the next b-leg asks
+// again. A b-leg with no a-leg (an originated call) looks up on its own.
+func (es *EventSubscriber) resolveUserForCall(alegUUID, extension, domainName string) *userCacheEntry {
+	if alegUUID == "" {
+		return es.resolveUser(extension, domainName)
 	}
-	es.userCacheMu.RUnlock()
 
+	key := alegUUID + ":" + domainName + ":" + extension
+	es.userCacheMu.Lock()
+	lookup, shared := es.userCache[key]
+	if !shared {
+		lookup = &callLookup{ready: make(chan struct{}), startedAt: time.Now()}
+		es.userCache[key] = lookup
+	}
+	es.userCacheMu.Unlock()
+
+	if !shared {
+		lookup.resolved = es.resolveUser(extension, domainName)
+		if lookup.resolved == nil {
+			es.userCacheMu.Lock()
+			delete(es.userCache, key)
+			es.userCacheMu.Unlock()
+		}
+		close(lookup.ready)
+	}
+
+	<-lookup.ready
+	return lookup.resolved
+}
+
+// resolveUser looks up the users of an extension via the configured resolve endpoint.
+// Nil when the extension has no user or the endpoint could not answer.
+func (es *EventSubscriber) resolveUser(extension, domainName string) *userCacheEntry {
 	payload, err := json.Marshal(map[string]string{
 		"p_extension":   extension,
 		"p_domain_name": domainName,
@@ -735,10 +768,6 @@ func (es *EventSubscriber) resolveUser(extension, domainName string) *userCacheE
 		resolvedAt: time.Now(),
 	}
 
-	es.userCacheMu.Lock()
-	es.userCache[cacheKey] = entry
-	es.userCacheMu.Unlock()
-
 	uuids := make([]string, len(users))
 	for i, u := range users {
 		uuids[i] = u.userUuid
@@ -779,8 +808,8 @@ func (es *EventSubscriber) cleanupStaleRegistrations(maxAge time.Duration) {
 	es.mu.Unlock()
 
 	es.userCacheMu.Lock()
-	for key, entry := range es.userCache {
-		if entry.resolvedAt.Before(cutoff) {
+	for key, lookup := range es.userCache {
+		if lookup.startedAt.Before(cutoff) {
 			delete(es.userCache, key)
 		}
 	}
