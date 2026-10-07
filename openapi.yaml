@@ -282,7 +282,12 @@ components:
           properties:
             response:
               type: string
-              description: Call UUID or job UUID returned by FreeSWITCH
+              description: >
+                UUID of the A-leg that answered, from FreeSWITCH's `+OK <uuid>`.
+                For a forked A-leg (`user/<ext>@<domain>` rings every
+                registration) it is the leg that picked up. The call is tracked
+                for `call_event` broadcasts only when this is a canonical
+                lowercase UUID.
       required: [status, data]
 
     # -- Callcenter schemas ------------------------------------------------
@@ -416,9 +421,18 @@ components:
           type: string
         timeout_sec:
           type: integer
+          maximum: 85
+          example: 30
+          description: >
+            Ring timeout in seconds (default 60). At most 85, so the reply
+            always arrives within the server's response timeout; above that
+            the request is refused with 400.
         channel_variables:
           type: object
           additionalProperties: true
+          description: >
+            Additional FreeSWITCH channel variables. `originate_timeout` is
+            refused (400); use `timeout_sec`.
 
     AgentAddRequest:
       type: object
@@ -1031,6 +1045,11 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/OriginateRequest"
+      description: >
+        Runs `originate` synchronously on its own ESL connection, so the reply
+        is always this request's. Blocks until the A-leg answers or the
+        originate times out (`timeout_sec`, default 60 s). At most 20
+        originates run at once per server; more are refused with 503.
       responses:
         "200":
           description: Call originated
@@ -1042,11 +1061,68 @@ paths:
               schema:
                 $ref: "#/components/schemas/OriginateResponse"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          description: >
+            Invalid request: missing `aleg`, `timeout_sec` above 85,
+            `originate_timeout` in `channel_variables`, or FreeSWITCH rejected
+            the originate arguments (`-USAGE`; message
+            `Invalid originate arguments: -USAGE: …`).
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorMessage"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          description: >
+            FreeSWITCH could not place the call: a call outcome such as
+            `USER_BUSY`, `NO_ANSWER`, `CALL_REJECTED` or
+            `USER_NOT_REGISTERED`. The message is `Call not placed: <cause>`.
+            Nothing is tracked.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorMessage"
+              example:
+                status: error
+                message: "Call not placed: USER_BUSY"
         "502":
-          $ref: "#/components/responses/BadGateway"
+          description: >
+            ESL transport failure (connect, authentication, connection lost,
+            timeout) or a reply that is neither `+OK`, `-ERR` nor `-USAGE`. Nothing is
+            tracked.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorMessage"
+        "503":
+          description: >
+            Too many originates already in flight on this server (20 at a
+            time). Refused at once, without queueing and without contacting
+            FreeSWITCH; retry after the `Retry-After` delay.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+            Retry-After:
+              description: Seconds to wait before retrying
+              schema:
+                type: integer
+                example: 5
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorMessage"
+              example:
+                status: error
+                message: "Too many calls being originated; retry shortly"
 
   # -------------------------------------------------------------------------
   # Callcenter — Queues

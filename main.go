@@ -17,32 +17,35 @@ import (
 const Version = "0.5.0"
 
 var (
-	FSAPI_PORT             = getEnv("FSAPI_PORT", "37274")
-	ESL_HOST               = getEnv("ESL_HOST", "localhost")
-	ESL_PORT               = getEnv("ESL_PORT", "8021")
-	ESL_PASSWORD           = getEnv("ESL_PASSWORD", "ClueCon")
-	FSAPI_AUTH_TOKENS      = getEnv("FSAPI_AUTH_TOKENS", "")
-	BROADCAST_URL          = getEnv("BROADCAST_URL", "")
-	BROADCAST_SECRET       = getEnv("BROADCAST_SECRET", "")
-	INBOUND_WEBHOOK        = getEnv("INBOUND_WEBHOOK", "")
-	INBOUND_TOPIC_PREFIX   = getEnv("INBOUND_TOPIC_PREFIX", "")
-	RESOLVE_URL            = getEnv("RESOLVE_URL", "")
-	RESOLVE_SECRET         = getEnv("RESOLVE_SECRET", "")
+	FSAPI_PORT        = getEnv("FSAPI_PORT", "37274")
+	ESL_HOST          = getEnv("ESL_HOST", "localhost")
+	ESL_PORT          = getEnv("ESL_PORT", "8021")
+	ESL_PASSWORD      = getEnv("ESL_PASSWORD", "ClueCon")
+	FSAPI_AUTH_TOKENS = getEnv("FSAPI_AUTH_TOKENS", "")
+	BROADCAST_URL     = getEnv("BROADCAST_URL", "")
+	BROADCAST_SECRET  = getEnv("BROADCAST_SECRET", "")
+	RESOLVE_URL       = getEnv("RESOLVE_URL", "")
+	RESOLVE_SECRET    = getEnv("RESOLVE_SECRET", "")
 )
 
+// serverWriteTimeout bounds every response; a synchronous originate's
+// deadline is kept under it (maxOriginateTimeoutSec).
+const serverWriteTimeout = 120 * time.Second
+
 func main() {
-	handler := NewAPIHandler(ESL_HOST, ESL_PORT, ESL_PASSWORD)
+	// One serialized ESL connection for the commands whose reply decides who a
+	// call belongs to (uuid_dump): call authorization and call details.
+	channelDumps := newESLSerialClient(ESL_HOST, ESL_PORT, ESL_PASSWORD)
+	handler := NewAPIHandler(ESL_HOST, ESL_PORT, ESL_PASSWORD, channelDumps)
 
 	eventSub := NewEventSubscriber(EventSubscriberConfig{
-		ESLHost:            ESL_HOST,
-		ESLPort:            ESL_PORT,
-		ESLPassword:        ESL_PASSWORD,
-		BroadcastURL:       BROADCAST_URL,
-		BroadcastSecret:    BROADCAST_SECRET,
-		InboundWebhookURL:  INBOUND_WEBHOOK,
-		InboundTopicPrefix: INBOUND_TOPIC_PREFIX,
-		ResolveURL:         RESOLVE_URL,
-		ResolveSecret:      RESOLVE_SECRET,
+		ESLHost:         ESL_HOST,
+		ESLPort:         ESL_PORT,
+		ESLPassword:     ESL_PASSWORD,
+		BroadcastURL:    BROADCAST_URL,
+		BroadcastSecret: BROADCAST_SECRET,
+		ResolveURL:      RESOLVE_URL,
+		ResolveSecret:   RESOLVE_SECRET,
 	})
 	handler.eventSubscriber = eventSub
 
@@ -129,21 +132,18 @@ func main() {
 	if BROADCAST_URL != "" {
 		log.Printf("Event broadcast URL: %s", BROADCAST_URL)
 	}
-	if INBOUND_TOPIC_PREFIX != "" {
-		log.Printf("Inbound call topic prefix: %q (broadcasts to %s{e164_number})", INBOUND_TOPIC_PREFIX, INBOUND_TOPIC_PREFIX)
+	if BROADCAST_SECRET == "" {
+		log.Printf("WARNING: BROADCAST_SECRET is empty: worker broadcasts carry no X-Worker-Auth and are refused once the worker enforces producer secrets")
 	}
 	if RESOLVE_URL != "" {
 		log.Printf("Extension user resolve URL: %s", RESOLVE_URL)
-	}
-	if INBOUND_WEBHOOK != "" {
-		log.Printf("Inbound call webhook: %s", INBOUND_WEBHOOK)
 	}
 
 	srv := &http.Server{
 		Addr:         addr,
 		Handler:      r,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 120 * time.Second,
+		WriteTimeout: serverWriteTimeout,
 		IdleTimeout:  60 * time.Second,
 	}
 
@@ -194,6 +194,7 @@ func main() {
 	if err := handler.eslClient.Close(); err != nil {
 		log.Printf("Error closing ESL client: %v", err)
 	}
+	channelDumps.Close()
 
 	log.Println("Server exited")
 }

@@ -14,14 +14,11 @@ import (
 // state machine exercises quickly.
 func newTestSubscriber(t *testing.T, workerURL string) *EventSubscriber {
 	t.Helper()
-	orig := broadcastRetryBaseDelay
-	broadcastRetryBaseDelay = time.Millisecond
-	t.Cleanup(func() { broadcastRetryBaseDelay = orig })
-
 	return &EventSubscriber{
-		broadcastURL: workerURL,
-		ctx:          context.Background(),
-		httpClient:   &http.Client{Timeout: 2 * time.Second},
+		broadcastURL:   workerURL,
+		ctx:            context.Background(),
+		httpClient:     &http.Client{Timeout: 2 * time.Second},
+		retryBaseDelay: time.Millisecond,
 	}
 }
 

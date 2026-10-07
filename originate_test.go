@@ -1,0 +1,328 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math/rand/v2"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"regexp"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// Each originate runs on its own ESL connection, so its reply can only be
+// its own: the handler registers whatever canonical uuid that reply names.
+
+var alegIndex = regexp.MustCompile(`user/(\d+)@`)
+
+func originateHandlerFor(fs *fakeFreeSWITCH) (*APIHandler, *EventSubscriber) {
+	host, port := fs.hostPort()
+	es := NewEventSubscriber(EventSubscriberConfig{})
+	return &APIHandler{originateESL: newESLOneShot(host, port, "ClueCon-test"), originateSlots: make(chan struct{}, maxConcurrentOriginates), eventSubscriber: es}, es
+}
+
+func originate(t *testing.T, h *APIHandler, user, domain string, body map[string]any) *httptest.ResponseRecorder {
+	t.Helper()
+	b, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/calls/originate", bytes.NewReader(b))
+	req.Header.Set("X-User-UUID", user)
+	req.Header.Set("X-Domain-UUID", domain)
+	rec := httptest.NewRecorder()
+	h.OriginateCall(rec, req)
+	return rec
+}
+
+func registeredCalls(es *EventSubscriber) map[string]*CallRegistration {
+	es.mu.RLock()
+	defer es.mu.RUnlock()
+	out := make(map[string]*CallRegistration, len(es.registry))
+	for k, v := range es.registry {
+		out[k] = v
+	}
+	return out
+}
+
+func replyWith(reply string) func(int, string, net.Conn) bool {
+	return func(_ int, _ string, conn net.Conn) bool {
+		io.WriteString(conn, apiResponseFrame(reply))
+		return false
+	}
+}
+
+// Concurrent originates, answered out of order, each register the uuid of
+// their own reply under their own user and tenant, on one connection each.
+func TestConcurrentOriginatesRegisterTheirOwnReply(t *testing.T) {
+	const n = 20
+	var mu sync.Mutex
+	legOf := map[string]string{} // aleg index -> uuid replied
+	fs := newFakeFreeSWITCH(t, "ClueCon-test", func(_ int, cmd string, conn net.Conn) bool {
+		m := alegIndex.FindStringSubmatch(cmd)
+		if m == nil || !strings.HasPrefix(cmd, "originate ") {
+			io.WriteString(conn, apiResponseFrame("-ERR bad command\n"))
+			return true
+		}
+		leg := fmt.Sprintf("0e0e0e0e-0000-4000-8000-%012d", rand.IntN(1_000_000_000))
+		mu.Lock()
+		legOf[m[1]] = leg
+		mu.Unlock()
+		time.Sleep(time.Duration(rand.IntN(30)) * time.Millisecond)
+		io.WriteString(conn, apiResponseFrame("+OK "+leg+"\n"))
+		return true // FreeSWITCH would keep it; the client closes after one reply anyway
+	})
+	h, es := originateHandlerFor(fs)
+	var wg sync.WaitGroup
+	users := map[string]string{}
+	for i := 0; i < n; i++ {
+		user, domain := fxUser1, fxDomainA
+		if i%2 == 1 {
+			user, domain = fxUser2, fxDomainB
+		}
+		users[fmt.Sprint(i)] = user
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := originate(t, h, user, domain, map[string]any{"aleg": fmt.Sprintf("user/%d@acme.example.com", i)})
+			if rec.Code != http.StatusOK {
+				t.Errorf("status %d: %s", rec.Code, rec.Body)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := fs.acceptCount(); got != n {
+		t.Fatalf("connections = %d, want one per originate (%d)", got, n)
+	}
+	reg := registeredCalls(es)
+	if len(reg) != n {
+		t.Fatalf("registered %d calls, want %d", len(reg), n)
+	}
+	for i, leg := range legOf {
+		r := reg[leg]
+		if r == nil || r.UserUUID != users[i] {
+			t.Fatalf("leg %s of request %s registered as %+v, want user %s", leg, i, r, users[i])
+		}
+		wantDomain := map[string]string{fxUser1: fxDomainA, fxUser2: fxDomainB}[r.UserUUID]
+		if r.DomainUUID != wantDomain {
+			t.Fatalf("leg %s registered with domain %s", leg, r.DomainUUID)
+		}
+	}
+}
+
+// A forked A-leg (user/<ext>@<domain> rings every registration) answers with
+// the uuid of whichever leg picked up: that leg is registered. No
+// origination_uuid is added to the dial string.
+func TestOriginateRegistersTheAnsweringForkLeg(t *testing.T) {
+	fs := newFakeFreeSWITCH(t, "ClueCon-test", replyWith("+OK "+fxCallY+"\n"))
+	h, es := originateHandlerFor(fs)
+	rec := originate(t, h, fxUser1, fxDomainA, map[string]any{"aleg": "user/101@acme.example.com"})
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), fxCallY) {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if r := registeredCalls(es)[fxCallY]; r == nil || r.UserUUID != fxUser1 || r.DomainUUID != fxDomainA {
+		t.Fatalf("registry = %+v", registeredCalls(es))
+	}
+	cmds := fs.commands()
+	if len(cmds) != 2 || strings.Contains(cmds[1], "origination_uuid") || cmds[1] != "1:api originate user/101@acme.example.com &park()" {
+		t.Fatalf("commands = %q", cmds)
+	}
+}
+
+// A caller-supplied origination_uuid is passed through unchanged, as in HEAD.
+func TestOriginatePassesCallerOriginationUUIDThrough(t *testing.T) {
+	fs := newFakeFreeSWITCH(t, "ClueCon-test", replyWith("+OK "+fxCallX+"\n"))
+	h, es := originateHandlerFor(fs)
+	rec := originate(t, h, fxUser1, fxDomainA, map[string]any{
+		"aleg":              "user/101@acme.example.com",
+		"channel_variables": map[string]any{"origination_uuid": fxCallX},
+	})
+	if rec.Code != http.StatusOK || registeredCalls(es)[fxCallX] == nil {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if cmd := fs.commands()[1]; cmd != "1:api originate {origination_uuid="+fxCallX+"}user/101@acme.example.com &park()" {
+		t.Fatalf("command %q", cmd)
+	}
+}
+
+// A connection error answers 502 and registers nothing.
+func TestOriginateConnectionErrorRegistersNothing(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, port, _ := net.SplitHostPort(ln.Addr().String())
+	ln.Close()
+	es := NewEventSubscriber(EventSubscriberConfig{})
+	h := &APIHandler{originateESL: newESLOneShot(host, port, "ClueCon-test"), originateSlots: make(chan struct{}, maxConcurrentOriginates), eventSubscriber: es}
+	rec := originate(t, h, fxUser1, fxDomainA, map[string]any{"aleg": "user/101@acme.example.com"})
+	if rec.Code != http.StatusBadGateway || len(registeredCalls(es)) != 0 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+}
+
+// The connection closing before the reply is a transport failure: 502, nothing registered.
+func TestOriginateConnectionDroppedRegistersNothing(t *testing.T) {
+	fs := newFakeFreeSWITCH(t, "ClueCon-test", func(int, string, net.Conn) bool { return true })
+	h, es := originateHandlerFor(fs)
+	rec := originate(t, h, fxUser1, fxDomainA, map[string]any{"aleg": "user/101@acme.example.com"})
+	if rec.Code != http.StatusBadGateway || len(registeredCalls(es)) != 0 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+}
+
+// A FreeSWITCH -ERR is a call outcome: 409 with the cause, nothing registered.
+func TestOriginateErrReplyIsConflictWithCause(t *testing.T) {
+	fs := newFakeFreeSWITCH(t, "ClueCon-test", replyWith("-ERR USER_BUSY\n"))
+	h, es := originateHandlerFor(fs)
+	rec := originate(t, h, fxUser1, fxDomainA, map[string]any{"aleg": "user/101@acme.example.com"})
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "Call not placed: USER_BUSY") {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if len(registeredCalls(es)) != 0 {
+		t.Fatalf("registered %v", registeredCalls(es))
+	}
+}
+
+// A reply that is neither +OK nor -ERR is a gateway fault: 502.
+func TestOriginateUnexpectedReply(t *testing.T) {
+	fs := newFakeFreeSWITCH(t, "ClueCon-test", replyWith("garbage\n"))
+	h, es := originateHandlerFor(fs)
+	rec := originate(t, h, fxUser1, fxDomainA, map[string]any{"aleg": "user/101@acme.example.com"})
+	if rec.Code != http.StatusBadGateway || len(registeredCalls(es)) != 0 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+}
+
+// +OK naming something that is not a canonical uuid: the call was placed
+// (200 as in HEAD) but is not tracked.
+func TestOriginateNonCanonicalReplyIsNotTracked(t *testing.T) {
+	fs := newFakeFreeSWITCH(t, "ClueCon-test", replyWith("+OK MY-CALL\n"))
+	h, es := originateHandlerFor(fs)
+	rec := originate(t, h, fxUser1, fxDomainA, map[string]any{"aleg": "user/101@acme.example.com"})
+	if rec.Code != http.StatusOK || len(registeredCalls(es)) != 0 {
+		t.Fatalf("status %d: %s; registry %v", rec.Code, rec.Body, registeredCalls(es))
+	}
+}
+
+// In-flight originates are capped: when every slot is held, originate answers
+// 503 with Retry-After at once (no queueing), and a freed slot is reusable.
+func TestOriginateCapAnswers503WhenFull(t *testing.T) {
+	release := make(chan struct{})
+	received := make(chan struct{}, 8)
+	fs := newFakeFreeSWITCH(t, "ClueCon-test", func(_ int, _ string, conn net.Conn) bool {
+		received <- struct{}{}
+		<-release
+		io.WriteString(conn, apiResponseFrame("+OK "+fxCallX+"\n"))
+		return true
+	})
+	h, _ := originateHandlerFor(fs)
+	h.originateSlots = make(chan struct{}, 2)
+
+	codes := make(chan int, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			codes <- originate(t, h, fxUser1, fxDomainA, map[string]any{"aleg": "user/101@acme.example.com"}).Code
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-received:
+		case <-time.After(3 * time.Second):
+			t.Fatal("originates did not reach FreeSWITCH")
+		}
+	}
+
+	start := time.Now()
+	rec := originate(t, h, fxUser1, fxDomainA, map[string]any{"aleg": "user/101@acme.example.com"})
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != originateRetryAfter {
+		t.Fatalf("status %d, Retry-After %q: %s", rec.Code, rec.Header().Get("Retry-After"), rec.Body)
+	}
+	if time.Since(start) > 500*time.Millisecond {
+		t.Fatalf("the refusal waited %s instead of answering at once", time.Since(start))
+	}
+	if n := fs.acceptCount(); n != 2 {
+		t.Fatalf("the refused originate reached FreeSWITCH (%d dials)", n)
+	}
+
+	close(release)
+	for i := 0; i < 2; i++ {
+		if c := <-codes; c != http.StatusOK {
+			t.Fatalf("held originate answered %d", c)
+		}
+	}
+	if c := originate(t, h, fxUser1, fxDomainA, map[string]any{"aleg": "user/101@acme.example.com"}).Code; c != http.StatusOK {
+		t.Fatalf("after release: %d", c)
+	}
+}
+
+// A request refused before dialing (bad body) holds no slot.
+func TestOriginateBadRequestHoldsNoSlot(t *testing.T) {
+	fs := newFakeFreeSWITCH(t, "ClueCon-test", replyWith("+OK "+fxCallX+"\n"))
+	h, _ := originateHandlerFor(fs)
+	h.originateSlots = make(chan struct{}, 1)
+	if c := originate(t, h, fxUser1, fxDomainA, map[string]any{}).Code; c != http.StatusBadRequest {
+		t.Fatalf("status %d", c)
+	}
+	if len(h.originateSlots) != 0 {
+		t.Fatal("slot leaked")
+	}
+	if c := originate(t, h, fxUser1, fxDomainA, map[string]any{"aleg": "user/101@acme.example.com"}).Code; c != http.StatusOK || len(h.originateSlots) != 0 {
+		t.Fatalf("status %d, slots held %d", c, len(h.originateSlots))
+	}
+}
+
+// A FreeSWITCH -USAGE reply (malformed arguments) is a client error: 400.
+func TestOriginateUsageReplyIsBadRequest(t *testing.T) {
+	fs := newFakeFreeSWITCH(t, "ClueCon-test", replyWith("-USAGE: <call url> <exten>|&<application_name>(<app_args>)\n"))
+	h, es := originateHandlerFor(fs)
+	rec := originate(t, h, fxUser1, fxDomainA, map[string]any{"aleg": "user/101@acme.example.com"})
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "Invalid originate arguments: -USAGE") {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if len(registeredCalls(es)) != 0 {
+		t.Fatalf("registered %v", registeredCalls(es))
+	}
+}
+
+// timeout_sec above 85 and originate_timeout in channel_variables are refused
+// before anything is sent; 85 itself and the Chrome extension's 30 pass.
+func TestOriginateTimeoutBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body map[string]any
+		want int
+	}{
+		{"timeout_sec 30 (Chrome extension)", map[string]any{"aleg": "user/101@acme.example.com", "timeout_sec": 30}, http.StatusOK},
+		{"timeout_sec 85", map[string]any{"aleg": "user/101@acme.example.com", "timeout_sec": 85}, http.StatusOK},
+		{"timeout_sec 86", map[string]any{"aleg": "user/101@acme.example.com", "timeout_sec": 86}, http.StatusBadRequest},
+		{"originate_timeout variable", map[string]any{"aleg": "user/101@acme.example.com", "channel_variables": map[string]any{"originate_timeout": 300}}, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := newFakeFreeSWITCH(t, "ClueCon-test", replyWith("+OK "+fxCallX+"\n"))
+			h, _ := originateHandlerFor(fs)
+			rec := originate(t, h, fxUser1, fxDomainA, tc.body)
+			if rec.Code != tc.want {
+				t.Fatalf("status %d, want %d: %s", rec.Code, tc.want, rec.Body)
+			}
+			if tc.want == http.StatusBadRequest && (fs.acceptCount() != 0 || len(h.originateSlots) != 0) {
+				t.Fatalf("refused request reached FreeSWITCH (%d dials) or held a slot", fs.acceptCount())
+			}
+		})
+	}
+}
+
+// The longest accepted ring time still fits the server's WriteTimeout.
+func TestOriginateDeadlineFitsWriteTimeout(t *testing.T) {
+	for _, d := range []time.Duration{time.Duration(maxOriginateTimeoutSec) * time.Second, defaultOriginateTimeout} {
+		if d+originateReplyMargin >= serverWriteTimeout {
+			t.Fatalf("originate deadline %s is not under the %s WriteTimeout", d+originateReplyMargin, serverWriteTimeout)
+		}
+	}
+}

@@ -2,10 +2,11 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
 
 const (
@@ -42,21 +43,30 @@ func getAllowedContexts(r *http.Request) []string {
 	return nil
 }
 
+// channelDumper runs `uuid_dump` with each reply matched to its request
+// (eslSerialClient): a dump for another call must never decide a call's
+// authorization or be returned as its details.
+type channelDumper interface {
+	ChannelDump(ctx context.Context, callUUID string) (map[string]any, error)
+}
+
+// channelDumpTimeout bounds one uuid_dump, including waiting for the serialized connection.
+const channelDumpTimeout = 10 * time.Second
+
 // getCallContext fetches call context information from FreeSWITCH
 func (h *APIHandler) getCallContext(callUUID string) (*CallContextInfo, error) {
-	// Use uuid_dump to get full channel variables for the call
-	response, err := h.eslClient.SendCommand(fmt.Sprintf("api uuid_dump %s json", callUUID))
+	// FreeSWITCH call uuids are canonical lowercase; anything else names no channel.
+	if !canonicalUUID.MatchString(callUUID) {
+		return &CallContextInfo{UUID: callUUID, Found: false}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), channelDumpTimeout)
+	defer cancel()
+	dumpData, err := h.channelDumps.ChannelDump(ctx, callUUID)
+	if errors.Is(err, errChannelGone) {
+		return &CallContextInfo{UUID: callUUID, Found: false}, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to retrieve call: %v", err)
-	}
-
-	// If uuid_dump returns an error (call not found), the response won't be valid JSON
-	var dumpData map[string]interface{}
-	if err := json.Unmarshal([]byte(response), &dumpData); err != nil {
-		return &CallContextInfo{
-			UUID:  callUUID,
-			Found: false,
-		}, nil
 	}
 
 	// Determine context: prefer variable_accountcode, then Caller-Context, then variable_domain_name

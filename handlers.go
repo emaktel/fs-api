@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -25,12 +27,21 @@ func getRequestID(r *http.Request) string {
 // API Handlers
 type APIHandler struct {
 	eslClient ESLClient
+	// channelDumps runs uuid_dump on the serialized connection (see eslSerialClient).
+	channelDumps channelDumper
+	// originateESL runs each originate on its own connection (see eslOneShot);
+	// originateSlots holds one token per in-flight originate.
+	originateESL    eslOneShot
+	originateSlots  chan struct{}
 	eventSubscriber *EventSubscriber
 }
 
-func NewAPIHandler(eslHost, eslPort, eslPassword string) *APIHandler {
+func NewAPIHandler(eslHost, eslPort, eslPassword string, channelDumps channelDumper) *APIHandler {
 	return &APIHandler{
-		eslClient: NewESLClient(eslHost, eslPort, eslPassword),
+		eslClient:      NewESLClient(eslHost, eslPort, eslPassword),
+		channelDumps:   channelDumps,
+		originateESL:   newESLOneShot(eslHost, eslPort, eslPassword),
+		originateSlots: make(chan struct{}, maxConcurrentOriginates),
 	}
 }
 
@@ -454,6 +465,25 @@ func (h *APIHandler) ParkCall(w http.ResponseWriter, r *http.Request) {
 	h.respondSuccess(w, r, fmt.Sprintf("Call %s parked", callUUID))
 }
 
+// Originate runs on its own ESL connection, held for the whole ring time.
+// defaultOriginateTimeout is FreeSWITCH's originate_timeout default;
+// originateReplyMargin covers dialing and the reply on top of it.
+// maxOriginateTimeoutSec keeps the originate deadline (timeout + margin)
+// under serverWriteTimeout, so the reply always reaches the caller.
+const (
+	defaultOriginateTimeout = 60 * time.Second
+	originateReplyMargin    = 30 * time.Second
+	maxOriginateTimeoutSec  = 85
+)
+
+// maxConcurrentOriginates caps in-flight originates per box: each holds a TCP
+// connection, a FreeSWITCH listener thread and a goroutine for up to the whole
+// ring time. When full, originate answers 503 at once with Retry-After.
+const (
+	maxConcurrentOriginates = 20
+	originateRetryAfter     = "5"
+)
+
 // POST /v1/calls/originate
 func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 	requestID := getRequestID(r)
@@ -475,6 +505,17 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 		if !h.validateRequestContext(w, r, req.Context) {
 			return
 		}
+	}
+
+	// The ring time is bounded by timeout_sec alone, so the originate always
+	// finishes (and its reply reaches the caller) inside the deadline.
+	if req.TimeoutSec > maxOriginateTimeoutSec {
+		h.respondError(w, r, fmt.Sprintf("timeout_sec must be at most %d", maxOriginateTimeoutSec), http.StatusBadRequest)
+		return
+	}
+	if _, set := req.ChannelVariables["originate_timeout"]; set {
+		h.respondError(w, r, "channel_variables.originate_timeout is not accepted; use timeout_sec", http.StatusBadRequest)
+		return
 	}
 
 	// If bleg is not provided, default to park
@@ -516,7 +557,7 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 
 	// Build the originate command: originate {vars}aleg bleg [dialplan] [context] [cid_name] [cid_num] [timeout]
 	var cmd strings.Builder
-	cmd.WriteString("api originate ")
+	cmd.WriteString("originate ")
 
 	// Add channel variables if present
 	if channelVars != "" {
@@ -562,26 +603,62 @@ func (h *APIHandler) OriginateCall(w http.ResponseWriter, r *http.Request) {
 		cmd.WriteString(fmt.Sprintf("%d", req.TimeoutSec))
 	}
 
-	// Send the originate command
-	response, err := h.eslClient.SendCommand(cmd.String())
-	if err != nil {
-		statusCode := h.getErrorStatusCode(err)
-		h.respondError(w, r, fmt.Sprintf("Failed to originate call: %v", err), statusCode)
+	// Send the originate on its own ESL connection. The shared connection does
+	// not match replies to requests, so a uuid read from its reply could be
+	// another command's call, which would then be registered (for call_event)
+	// under this caller's user and tenant. On a dedicated connection the reply
+	// can only be this command's: the uuid of the A-leg that answered, which
+	// for a forked user/<ext>@<domain> A-leg may be any of its legs.
+	select {
+	case h.originateSlots <- struct{}{}:
+		defer func() { <-h.originateSlots }()
+	default:
+		logWarn(requestID, fmt.Sprintf("originate refused: %d originates already in flight", cap(h.originateSlots)))
+		w.Header().Set("Retry-After", originateRetryAfter)
+		h.respondError(w, r, "Too many calls being originated; retry shortly", http.StatusServiceUnavailable)
 		return
 	}
 
-	logInfo(requestID, "Call originated successfully")
+	timeout := defaultOriginateTimeout
+	if req.TimeoutSec > 0 {
+		timeout = time.Duration(req.TimeoutSec) * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout+originateReplyMargin)
+	defer cancel()
+	logInfo(requestID, "ESL Command: api "+cmd.String())
+	reply, err := h.originateESL.API(ctx, cmd.String())
+	if err != nil {
+		h.respondError(w, r, fmt.Sprintf("Failed to originate call: %v", err), http.StatusBadGateway)
+		return
+	}
 
 	// Parse call UUID from response (format: "+OK <uuid>")
-	response = strings.TrimSpace(response)
-	if strings.HasPrefix(response, "+OK ") {
-		response = strings.TrimPrefix(response, "+OK ")
-		response = strings.TrimPrefix(response, "Job-UUID: ")
+	response := strings.TrimSpace(string(reply))
+	if strings.HasPrefix(response, "-ERR") {
+		// FreeSWITCH could not place the call: a call outcome (USER_BUSY,
+		// NO_ANSWER, CALL_REJECTED, ...) that conflicts with the request, not a
+		// gateway fault. 409 with the cause.
+		h.respondError(w, r, fmt.Sprintf("Call not placed: %s", strings.TrimSpace(strings.TrimPrefix(response, "-ERR"))), http.StatusConflict)
+		return
 	}
-	parsedCallUUID := strings.TrimSpace(response)
+	if strings.HasPrefix(response, "-USAGE") {
+		// FreeSWITCH rejected the originate arguments: a client error.
+		h.respondError(w, r, fmt.Sprintf("Invalid originate arguments: %s", response), http.StatusBadRequest)
+		return
+	}
+	if !strings.HasPrefix(response, "+OK") {
+		h.respondError(w, r, fmt.Sprintf("Failed to originate call: unexpected reply %q", response), http.StatusBadGateway)
+		return
+	}
+	response = strings.TrimSpace(strings.TrimPrefix(response, "+OK"))
+	parsedCallUUID := response
+
+	logInfo(requestID, "Call originated successfully")
 
 	// Register call for event tracking
-	if h.eventSubscriber != nil && parsedCallUUID != "" {
+	if !canonicalUUID.MatchString(parsedCallUUID) {
+		logWarn(requestID, fmt.Sprintf("originate reply names %q, not a canonical uuid; call not tracked for events", parsedCallUUID))
+	} else if h.eventSubscriber != nil {
 		userUUID := r.Header.Get("X-User-UUID")
 		domainUUID := r.Header.Get("X-Domain-UUID")
 		allowedContexts := getAllowedContexts(r)
@@ -818,37 +895,29 @@ func (h *APIHandler) GetCallDetails(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 3: Dump A-leg details as JSON
-	aLegDumpCmd := fmt.Sprintf("api uuid_dump %s json", aLegUUID)
-	aLegDetailsStr, err := h.eslClient.SendCommand(aLegDumpCmd)
+	// Step 3: Dump A-leg details on the serialized connection, so the details
+	// returned are always this call's.
+	dumpCtx, dumpCancel := context.WithTimeout(r.Context(), channelDumpTimeout)
+	defer dumpCancel()
+	aLegDetails, err := h.channelDumps.ChannelDump(dumpCtx, aLegUUID)
+	if errors.Is(err, errChannelGone) {
+		h.respondError(w, r, fmt.Sprintf("Call %s not found", callUUID), http.StatusNotFound)
+		return
+	}
 	if err != nil {
 		logWarn(requestID, fmt.Sprintf("Failed to retrieve A-leg details: %v", err))
 		h.respondError(w, r, fmt.Sprintf("Failed to retrieve A-leg details: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Parse A-leg JSON
-	var aLegDetails map[string]interface{}
-	if err := json.Unmarshal([]byte(aLegDetailsStr), &aLegDetails); err != nil {
-		logWarn(requestID, fmt.Sprintf("Failed to parse A-leg details: %v", err))
-		h.respondError(w, r, fmt.Sprintf("Failed to parse A-leg details: %v", err), http.StatusInternalServerError)
-		return
-	}
-
 	// Step 4: Dump B-leg details (if B-leg exists)
 	var bLegDetails map[string]interface{}
 	if bLegUUID != "" {
-		bLegDumpCmd := fmt.Sprintf("api uuid_dump %s json", bLegUUID)
-		bLegDetailsStr, err := h.eslClient.SendCommand(bLegDumpCmd)
+		bLegDetails, err = h.channelDumps.ChannelDump(dumpCtx, bLegUUID)
 		if err != nil {
-			logWarn(requestID, fmt.Sprintf("Failed to retrieve B-leg details: %v", err))
 			// B-leg might not exist anymore, this is not fatal
+			logWarn(requestID, fmt.Sprintf("Failed to retrieve B-leg details: %v", err))
 			bLegDetails = nil
-		} else {
-			if err := json.Unmarshal([]byte(bLegDetailsStr), &bLegDetails); err != nil {
-				logWarn(requestID, fmt.Sprintf("Failed to parse B-leg details: %v", err))
-				bLegDetails = nil
-			}
 		}
 	}
 

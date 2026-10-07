@@ -86,8 +86,6 @@ The API can be configured using environment variables. If environment variables 
 | `FSAPI_AUTH_TOKENS` | Comma-separated Bearer tokens for authentication | *(none)* |
 | `BROADCAST_URL` | WebSocket worker base URL for real-time event broadcasts | *(none)* |
 | `BROADCAST_SECRET` | Auth token for the broadcast endpoint (`X-Worker-Auth` header) | *(none)* |
-| `INBOUND_TOPIC_PREFIX` | Topic prefix for inbound call broadcasts (e.g. `inbox:`) | *(none)* |
-| `INBOUND_WEBHOOK` | URL to POST inbound call data to (optional webhook) | *(none)* |
 | `RESOLVE_URL` | REST endpoint to resolve extension+domain → user UUID | *(none)* |
 | `RESOLVE_SECRET` | Bearer token for the resolve endpoint | *(none)* |
 
@@ -1185,17 +1183,11 @@ fs-api subscribes to FreeSWITCH ESL events and can broadcast real-time call noti
 
 ### Event Types
 
-**Inbound Call Detection** — Detects new inbound a-legs (CHANNEL_CREATE, direction=inbound, context=public). Deduplicates by call UUID to prevent duplicate notifications from ring groups, queue retries, or transfers.
-
-When `BROADCAST_URL` and `INBOUND_TOPIC_PREFIX` are set, broadcasts a `thread_event` to `{prefix}{e164_number}` (e.g. `inbox:+15145551234`). Consumers subscribe to per-number topics to receive notifications for their numbers only.
-
-When `INBOUND_WEBHOOK` is set, POSTs call data to the configured URL for custom processing.
-
-**Extension Ring Detection** — Detects b-legs ringing specific extensions (CHANNEL_CREATE, direction=outbound, domain context). When `RESOLVE_URL` is configured, resolves the extension to a user UUID via the REST endpoint, then broadcasts a targeted `incoming_call` event to that specific user.
+**Extension Ring Detection** — Detects b-legs ringing specific extensions (CHANNEL_CREATE, direction=outbound, domain context). When `RESOLVE_URL` is configured, resolves the extension to its users (and each user's tenant) via the REST endpoint, then broadcasts a targeted `incoming_call` event to those users, one broadcast per tenant, each carrying that tenant's `domainUuid`.
 
 The resolve endpoint is called with `{ "p_extension": "101", "p_domain_name": "example.com" }` and should return `[{ "user_uuid": "...", "domain_uuid": "..." }]`. Results are cached for 5 minutes.
 
-**Call Lifecycle Tracking** — After a successful ring broadcast, fs-api tracks the b-leg call UUID and forwards CHANNEL_ANSWER and CHANNEL_HANGUP events as `call_state` messages to the same user. This enables clients to update or dismiss call notifications in real time (e.g. dismiss on answer, show "Ended" on cancel).
+**Call Lifecycle Tracking** — Once the extension is resolved, fs-api registers the b-leg call UUID (before the ring broadcast is sent) and forwards CHANNEL_ANSWER and CHANNEL_HANGUP events as `call_state` messages to the same users, again one broadcast per tenant. This enables clients to update or dismiss call notifications in real time (e.g. dismiss on answer, show "Ended" on cancel).
 
 ### Originated Call Events
 
@@ -1213,14 +1205,15 @@ For calls initiated via `/v1/calls/originate`, fs-api tracks the call UUID and f
 ```
 ├── main.go           # Server initialization, routing, and configuration
 ├── handlers.go       # Call control endpoint handlers
-├── events.go         # ESL event subscriber, inbound/ring detection, lifecycle tracking
+├── events.go         # ESL event subscriber, ring detection, lifecycle tracking
 ├── cc_handlers.go    # Callcenter endpoint handlers (queues, agents, tiers)
 ├── cc_parser.go      # Pipe-delimited output parser for mod_callcenter
 ├── cc_types.go       # Callcenter request/response types
 ├── auth.go           # Context authorization logic
 ├── middleware.go     # HTTP middleware functions
 ├── types.go          # Call control request/response structures
-├── esl.go            # FreeSWITCH ESL client
+├── esl.go            # FreeSWITCH ESL client (shared eslgo connection: call control, show commands)
+├── esl_client.go     # Raw ESL framing; serialized uuid_dump client; one connection per originate
 ├── utils.go          # Validation and logging helpers
 ├── openapi.yaml      # OpenAPI 3.0 specification
 ├── go.mod            # Go module definition

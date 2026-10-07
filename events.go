@@ -1,19 +1,22 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/textproto"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/percipia/eslgo"
-	"github.com/percipia/eslgo/command"
 )
 
 // CallRegistration tracks an originated call and where to send its events.
@@ -50,16 +53,6 @@ type BroadcastPayload struct {
 	Data       interface{} `json:"data"`
 }
 
-// InboundCallData is the payload broadcast when an inbound a-leg is detected.
-type InboundCallData struct {
-	CallUUID          string `json:"callUuid,omitempty"`
-	CallerIDNumber    string `json:"callerIdNumber"`
-	CallerIDName      string `json:"callerIdName,omitempty"`
-	DestinationNumber string `json:"destinationNumber"`
-	EventType         string `json:"eventType"`
-	Timestamp         int64  `json:"timestamp"`
-}
-
 // CallStateData is broadcast when a tracked call's state changes (answered, hangup, etc.).
 type CallStateData struct {
 	CallUUID    string `json:"callUuid"`
@@ -82,19 +75,39 @@ type RingCallData struct {
 
 // ringRegistration tracks a b-leg so answer/hangup events can be forwarded to the users.
 type ringRegistration struct {
-	userUuids  []string
-	domainUuid string
-	callerID   string
-	extension  string
-	createdAt  time.Time
+	tenants   []tenantRecipients
+	callerID  string
+	extension string
+	createdAt time.Time
 }
 
-func userUuidsFromResolved(users []resolvedUser) []string {
-	uuids := make([]string, len(users))
-	for i, u := range users {
-		uuids[i] = u.userUuid
+// tenantRecipients is one broadcast's audience: users who share the tenant
+// (domain_uuid) that resolve_extension_user returned for them, which is the
+// extension's tenant.
+type tenantRecipients struct {
+	domainUuid string
+	userUuids  []string
+}
+
+// groupByTenant splits resolved users into one audience per tenant, in the
+// order each tenant first appears. resolve_extension_user filters on a single
+// domain_name, so this is normally one group; domain_name uniqueness is not a
+// DB constraint, and the worker requires every named broadcast to carry the
+// recipients' tenant, so a mixed result is split rather than stamped with one
+// user's tenant.
+func groupByTenant(users []resolvedUser) []tenantRecipients {
+	var groups []tenantRecipients
+	index := make(map[string]int)
+	for _, u := range users {
+		i, ok := index[u.domainUuid]
+		if !ok {
+			i = len(groups)
+			index[u.domainUuid] = i
+			groups = append(groups, tenantRecipients{domainUuid: u.domainUuid})
+		}
+		groups[i].userUuids = append(groups[i].userUuids, u.userUuid)
 	}
-	return uuids
+	return groups
 }
 
 // resolvedUser holds a single user resolved from an extension.
@@ -118,19 +131,12 @@ type EventSubscriber struct {
 	broadcastURL    string
 	broadcastSecret string
 
-	// Inbound call notification config (optional, independent of originated call tracking)
-	inboundWebhookURL  string // POST inbound call data to this URL
-	inboundTopicPrefix string // Broadcast topic prefix (e.g. "inbox:") — topic becomes "{prefix}{normalized_did}"
-
 	// User resolution config — resolves extension+domain → user for targeted call pops
 	resolveURL    string // REST endpoint that returns [{user_uuid, domain_uuid}] given extension + domain
 	resolveSecret string // Optional auth token for the resolve endpoint
 
 	mu       sync.RWMutex
 	registry map[string]*CallRegistration // call_uuid -> registration
-
-	inboundMu   sync.Mutex
-	seenInbound map[string]time.Time // deduplication for inbound a-legs
 
 	userCacheMu sync.RWMutex
 	userCache   map[string]*userCacheEntry // "domain:extension" -> resolved user
@@ -146,7 +152,10 @@ type EventSubscriber struct {
 	seenRingMu sync.Mutex
 	seenRing   map[string]time.Time // "aleg_uuid:user_uuid" -> first seen
 
-	conn *eslgo.Conn
+	// eventProbe paces the liveness probe on the event connection, and
+	// reconnectDelay is the pause before Start redials it.
+	eventProbe     probeTiming
+	reconnectDelay time.Duration
 
 	// ctx is the lifecycle context captured in Start; broadcast retry backoff
 	// sleeps observe it so they unblock immediately on shutdown.
@@ -154,6 +163,8 @@ type EventSubscriber struct {
 
 	// httpClient is shared by all worker broadcasts (5s timeout per attempt).
 	httpClient *http.Client
+	// retryBaseDelay is the broadcast backoff base (a field so tests can shrink it).
+	retryBaseDelay time.Duration
 }
 
 // EventSubscriberConfig holds configuration for the event subscriber.
@@ -165,31 +176,45 @@ type EventSubscriberConfig struct {
 	BroadcastURL    string
 	BroadcastSecret string
 
-	InboundWebhookURL  string
-	InboundTopicPrefix string
-
 	ResolveURL    string
 	ResolveSecret string
 }
 
 func NewEventSubscriber(cfg EventSubscriberConfig) *EventSubscriber {
 	return &EventSubscriber{
-		eslHost:            cfg.ESLHost,
-		eslPort:            cfg.ESLPort,
-		eslPassword:        cfg.ESLPassword,
-		broadcastURL:       cfg.BroadcastURL,
-		broadcastSecret:    cfg.BroadcastSecret,
-		inboundWebhookURL:  cfg.InboundWebhookURL,
-		inboundTopicPrefix: cfg.InboundTopicPrefix,
-		resolveURL:         cfg.ResolveURL,
-		resolveSecret:      cfg.ResolveSecret,
-		registry:           make(map[string]*CallRegistration),
-		seenInbound:        make(map[string]time.Time),
-		userCache:          make(map[string]*userCacheEntry),
-		ringRegistry:       make(map[string]*ringRegistration),
-		seenRing:           make(map[string]time.Time),
-		httpClient:         &http.Client{Timeout: 5 * time.Second},
+		eslHost:         cfg.ESLHost,
+		eslPort:         cfg.ESLPort,
+		eslPassword:     cfg.ESLPassword,
+		broadcastURL:    cfg.BroadcastURL,
+		broadcastSecret: cfg.BroadcastSecret,
+		resolveURL:      cfg.ResolveURL,
+		resolveSecret:   cfg.ResolveSecret,
+		registry:        make(map[string]*CallRegistration),
+		userCache:       make(map[string]*userCacheEntry),
+		ringRegistry:    make(map[string]*ringRegistration),
+		seenRing:        make(map[string]time.Time),
+		eventProbe:      defaultEventProbe,
+		reconnectDelay:  5 * time.Second,
+		httpClient:      &http.Client{Timeout: 5 * time.Second},
+		retryBaseDelay:  defaultBroadcastRetryBaseDelay,
 	}
+}
+
+// probeTiming: probe the event connection every interval; a connection with
+// no traffic for interval+timeout is dead.
+type probeTiming struct {
+	interval time.Duration
+	timeout  time.Duration
+}
+
+var defaultEventProbe = probeTiming{interval: 15 * time.Second, timeout: 5 * time.Second}
+
+// lifecycleCtx is the context captured in Start (Background before Start).
+func (es *EventSubscriber) lifecycleCtx() context.Context {
+	if es.ctx == nil {
+		return context.Background()
+	}
+	return es.ctx
 }
 
 // RegisterCall adds a call to the registry so its events will be forwarded.
@@ -225,60 +250,125 @@ func (es *EventSubscriber) Start(ctx context.Context) {
 
 		err := es.connect(ctx)
 		if err != nil {
-			log.Printf("[Events] ESL connection error: %v, reconnecting in 5s", err)
+			log.Printf("[Events] ESL connection error: %v, reconnecting in %s", err, es.reconnectDelay)
 		}
 
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(5 * time.Second):
+		case <-time.After(es.reconnectDelay):
 		}
 	}
 }
 
+// eventSubscription is the `event plain` command sent on the event connection.
+const eventSubscription = "event plain CHANNEL_CREATE CHANNEL_ANSWER CHANNEL_HANGUP CHANNEL_BRIDGE CHANNEL_DESTROY"
+
+// connect runs one event connection until it ends, returning nil only on shutdown.
+//
+// The connection is read directly rather than through eslgo: eslgo reports a
+// lost connection only when FreeSWITCH sends a disconnect-notice, so one that
+// ended without it (EOF, a FreeSWITCH restart, a dead peer) left the
+// subscriber waiting forever with events silently stopped. Here any read
+// error ends the connection, and an `api status` probe every
+// eventProbe.interval guarantees traffic, so a connection that stays silent
+// for interval+timeout is treated as dead. Start then redials.
 func (es *EventSubscriber) connect(ctx context.Context) error {
 	log.Println("[Events] Connecting to ESL for event subscription...")
 
-	disconnected := make(chan struct{})
-	conn, err := eslgo.Dial(es.eslHost+":"+es.eslPort, es.eslPassword, func() {
-		log.Println("[Events] ESL event connection disconnected")
-		close(disconnected)
-	})
+	setupCtx, setupCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer setupCancel()
+	deadline, _ := setupCtx.Deadline()
+	conn, err := dialESL(setupCtx, net.JoinHostPort(es.eslHost, es.eslPort), es.eslPassword, deadline)
 	if err != nil {
 		return fmt.Errorf("dial failed: %w", err)
 	}
-	es.conn = conn
+	defer conn.Close()
+	// Shutdown unblocks the read loop below.
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
 	log.Println("[Events] ESL event connection established")
 
-	subCtx, subCancel := context.WithTimeout(ctx, 10*time.Second)
-	_, err = conn.SendCommand(subCtx, command.Event{
-		Format: "plain",
-		Listen: []string{
-			"CHANNEL_CREATE",
-			"CHANNEL_ANSWER",
-			"CHANNEL_HANGUP",
-			"CHANNEL_BRIDGE",
-			"CHANNEL_DESTROY",
-		},
-	})
-	subCancel()
-	if err != nil {
-		conn.ExitAndClose()
+	if err := eslCommand(conn, eventSubscription); err != nil {
 		return fmt.Errorf("event subscription failed: %w", err)
+	}
+	setupCancel()
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		return fmt.Errorf("clear deadline: %w", err)
 	}
 	log.Println("[Events] Subscribed to CHANNEL_CREATE, CHANNEL_ANSWER, CHANNEL_HANGUP, CHANNEL_BRIDGE, CHANNEL_DESTROY")
 
-	conn.RegisterEventListener(eslgo.EventListenAll, func(event *eslgo.Event) {
-		es.handleEvent(event)
-	})
+	probeCtx, probeCancel := context.WithCancel(ctx)
+	defer probeCancel()
+	go es.probeEventConn(probeCtx, conn)
 
-	select {
-	case <-ctx.Done():
-		conn.ExitAndClose()
-		return nil
-	case <-disconnected:
-		return fmt.Errorf("connection lost")
+	idle := es.eventProbe.interval + es.eventProbe.timeout
+	for {
+		if err := conn.SetReadDeadline(time.Now().Add(idle)); err != nil {
+			return fmt.Errorf("set read deadline: %w", err)
+		}
+		hdr, body, err := readESLFrame(conn.rd)
+		if errors.Is(err, errOversizedFrame) {
+			// The body was read and discarded; the stream is still in sync.
+			log.Printf("[Events] Skipped an oversized ESL frame (%s): %v", hdr.Get("Content-Type"), err)
+			continue
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("event connection lost: %w", err)
+		}
+		switch ct := hdr.Get("Content-Type"); ct {
+		case "text/event-plain":
+			event, err := parsePlainEvent(body)
+			if err != nil {
+				log.Printf("[Events] Unparseable ESL event: %v", err)
+				continue
+			}
+			go es.handleEvent(event)
+		case "text/disconnect-notice":
+			return fmt.Errorf("FreeSWITCH sent a disconnect-notice")
+		case "api/response":
+			// A probe reply; receiving it already renewed the read deadline.
+		default:
+			log.Printf("[Events] Ignoring unexpected ESL frame %q on the event connection", ct)
+		}
 	}
+}
+
+// probeEventConn writes `api status` every eventProbe.interval. The replies
+// are consumed by connect's read loop; a write that fails closes the
+// connection so the read loop ends.
+func (es *EventSubscriber) probeEventConn(ctx context.Context, conn net.Conn) {
+	ticker := time.NewTicker(es.eventProbe.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			err := conn.SetWriteDeadline(time.Now().Add(es.eventProbe.timeout))
+			if err == nil {
+				_, err = io.WriteString(conn, "api status\n\n")
+			}
+			if err != nil {
+				log.Printf("[Events] ESL event connection probe failed: %v; closing it to reconnect", err)
+				conn.Close()
+				return
+			}
+		}
+	}
+}
+
+// parsePlainEvent decodes a text/event-plain body: MIME-style headers whose
+// values stay URL-encoded (handleEvent decodes the ones it uses), as eslgo did.
+func parsePlainEvent(body []byte) (*eslgo.Event, error) {
+	headers, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(body))).ReadMIMEHeader()
+	if err != nil && !(errors.Is(err, io.EOF) && len(headers) > 0) {
+		return nil, err
+	}
+	return &eslgo.Event{Headers: headers}, nil
 }
 
 func (es *EventSubscriber) handleEvent(event *eslgo.Event) {
@@ -292,12 +382,6 @@ func (es *EventSubscriber) handleEvent(event *eslgo.Event) {
 	if eventName == "CHANNEL_CREATE" {
 		direction := event.Headers.Get("Call-Direction")
 		callerContext := event.Headers.Get("Caller-Context")
-
-		// Detect new inbound a-legs (external caller hitting a DID in the public context).
-		// This fires before ring groups, queues, or IVRs process the call.
-		if direction == "inbound" && callerContext == "public" {
-			es.handleInboundALeg(event, callUUID)
-		}
 
 		// Detect b-legs ringing extensions (FreeSWITCH calling out to a user's phone).
 		// direction=outbound in a domain context means an extension is being rung.
@@ -354,63 +438,10 @@ func (es *EventSubscriber) handleEvent(event *eslgo.Event) {
 	}
 }
 
-// handleInboundALeg fires once per new inbound call. Deduplicates by call UUID
-// so complex call flows (ring groups, queue retries, transfers) don't produce
-// duplicate notifications for the same call.
-func (es *EventSubscriber) handleInboundALeg(event *eslgo.Event, callUUID string) {
-	if es.broadcastURL == "" && es.inboundWebhookURL == "" {
-		return
-	}
-
-	es.inboundMu.Lock()
-	if _, seen := es.seenInbound[callUUID]; seen {
-		es.inboundMu.Unlock()
-		return
-	}
-	es.seenInbound[callUUID] = time.Now()
-	es.inboundMu.Unlock()
-
-	callerIDNumber := eslDecode(event.Headers.Get("Caller-Caller-ID-Number"))
-	callerIDName := eslDecode(event.Headers.Get("Caller-Caller-ID-Name"))
-	destinationNumber := eslDecode(event.Headers.Get("Caller-Destination-Number"))
-	domainUUID := eslDecode(event.Headers.Get("variable_domain_uuid"))
-	if domainUUID == "" {
-		domainUUID = eslDecode(event.Headers.Get("variable_dialed_domain_uuid"))
-	}
-
-	if callerIDNumber == "" || destinationNumber == "" {
-		return
-	}
-
-	log.Printf("[Events] Inbound a-leg: %s → %s (call %s, domain %s)",
-		callerIDNumber, destinationNumber, callUUID, domainUUID)
-
-	data := InboundCallData{
-		CallUUID:          callUUID,
-		CallerIDNumber:    callerIDNumber,
-		CallerIDName:      callerIDName,
-		DestinationNumber: destinationNumber,
-		EventType:         "call_ringing",
-		Timestamp:         time.Now().Unix(),
-	}
-
-	// Broadcast to inbox topic so all users with access see the call arrive in real-time.
-	// The thread-relay sends a separate call_ended event after reconciliation with
-	// richer data (duration, status, recording) — both are needed.
-	if es.broadcastURL != "" {
-		go es.broadcastInboundCall(domainUUID, destinationNumber, data)
-	}
-
-	if es.inboundWebhookURL != "" {
-		go es.postInboundWebhook(data, domainUUID)
-	}
-}
-
 const broadcastMaxRetries = 3
 
-// broadcastRetryBaseDelay is the base for exponential backoff (500ms, 1s, 2s).
-// A var rather than a const so tests can shrink it; production never reassigns it.
-var broadcastRetryBaseDelay = 500 * time.Millisecond
+// defaultBroadcastRetryBaseDelay is the base for exponential backoff (500ms, 1s, 2s).
+const defaultBroadcastRetryBaseDelay = 500 * time.Millisecond
 
 // sendBroadcast POSTs a payload to the WebSocket worker's /broadcast endpoint with
 // bounded exponential-backoff retry (3 attempts: 500ms, 1s, 2s). Network errors and
@@ -426,10 +457,7 @@ func (es *EventSubscriber) sendBroadcast(label string, payload BroadcastPayload)
 		return fmt.Errorf("marshal %s: %w", label, err)
 	}
 
-	ctx := es.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx := es.lifecycleCtx()
 
 	for attempt := 1; attempt <= broadcastMaxRetries; attempt++ {
 		if ctx.Err() != nil {
@@ -449,7 +477,7 @@ func (es *EventSubscriber) sendBroadcast(label string, payload BroadcastPayload)
 		if err != nil {
 			log.Printf("[Events] %s broadcast attempt %d/%d failed: %v", label, attempt, broadcastMaxRetries, err)
 			if attempt < broadcastMaxRetries {
-				sleepCtx(ctx, broadcastRetryBaseDelay*time.Duration(1<<(attempt-1)))
+				sleepCtx(ctx, es.retryBaseDelay*time.Duration(1<<(attempt-1)))
 			}
 			continue
 		}
@@ -465,7 +493,7 @@ func (es *EventSubscriber) sendBroadcast(label string, payload BroadcastPayload)
 
 		log.Printf("[Events] %s broadcast attempt %d/%d: status %d", label, attempt, broadcastMaxRetries, resp.StatusCode)
 		if attempt < broadcastMaxRetries {
-			sleepCtx(ctx, broadcastRetryBaseDelay*time.Duration(1<<(attempt-1)))
+			sleepCtx(ctx, es.retryBaseDelay*time.Duration(1<<(attempt-1)))
 		}
 	}
 	return fmt.Errorf("%s broadcast: all %d attempts failed", label, broadcastMaxRetries)
@@ -476,61 +504,6 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 	select {
 	case <-ctx.Done():
 	case <-time.After(d):
-	}
-}
-
-// broadcastInboundCall sends the inbound call event directly to the WebSocket worker.
-// If INBOUND_TOPIC_PREFIX is set (e.g. "inbox:"), the topic is "{prefix}{e164_number}",
-// enabling per-number subscriptions. Otherwise broadcasts to the domain.
-func (es *EventSubscriber) broadcastInboundCall(domainUUID, destinationNumber string, data InboundCallData) {
-	payload := BroadcastPayload{
-		DomainUUID: domainUUID,
-		Type:       "thread_event",
-		Data:       data,
-	}
-
-	if es.inboundTopicPrefix != "" {
-		normalized := normalizeToE164(destinationNumber)
-		payload.Topic = es.inboundTopicPrefix + normalized
-	}
-
-	if err := es.sendBroadcast("inbound_call", payload); err != nil {
-		log.Printf("[Events] Inbound broadcast failed: %v", err)
-		return
-	}
-	log.Printf("[Events] Inbound broadcast sent for %s → %s", data.CallerIDNumber, payload.Topic)
-}
-
-func (es *EventSubscriber) postInboundWebhook(data InboundCallData, domainUUID string) {
-	payload := map[string]interface{}{
-		"caller_id_number":   data.CallerIDNumber,
-		"caller_id_name":     data.CallerIDName,
-		"destination_number": data.DestinationNumber,
-		"domain_uuid":        domainUUID,
-		"call_uuid":          data.CallUUID,
-	}
-
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return
-	}
-
-	req, err := http.NewRequest("POST", es.inboundWebhookURL, bytes.NewReader(body))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("[Events] Inbound webhook failed: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		log.Printf("[Events] Inbound webhook returned %d for call %s", resp.StatusCode, data.CallUUID)
 	}
 }
 
@@ -598,13 +571,13 @@ func (es *EventSubscriber) handleExtensionRing(event *eslgo.Event, callUUID, dom
 	}
 
 	// Register this b-leg for all resolved users so answer/hangup events forward to them
+	tenants := groupByTenant(resolved.users)
 	es.ringMu.Lock()
 	es.ringRegistry[callUUID] = &ringRegistration{
-		userUuids:  userUuidsFromResolved(resolved.users),
-		domainUuid: resolved.users[0].domainUuid,
-		callerID:   callerIDNumber,
-		extension:  extension,
-		createdAt:  time.Now(),
+		tenants:   tenants,
+		callerID:  callerIDNumber,
+		extension: extension,
+		createdAt: time.Now(),
 	}
 	es.ringMu.Unlock()
 
@@ -632,7 +605,9 @@ func (es *EventSubscriber) handleExtensionRing(event *eslgo.Event, callUUID, dom
 		Timestamp:         time.Now().Unix(),
 	}
 
-	go es.broadcastRing(userUuidsFromResolved(resolved.users), data)
+	for _, t := range tenants {
+		go es.broadcastRing(t, data)
+	}
 }
 
 // handleRingLifecycle forwards answer/hangup events for tracked b-legs so the
@@ -660,8 +635,8 @@ func (es *EventSubscriber) handleRingLifecycle(callUUID, eventName string, event
 		hangupCause = eslDecode(event.Headers.Get("Hangup-Cause"))
 	}
 
-	log.Printf("[Events] Call state %s for %s@%s → %d users (cause: %s)",
-		state, reg.extension, reg.callerID, len(reg.userUuids), hangupCause)
+	log.Printf("[Events] Call state %s for %s@%s → %d tenant(s) (cause: %s)",
+		state, reg.extension, reg.callerID, len(reg.tenants), hangupCause)
 
 	data := CallStateData{
 		CallUUID:    callUUID,
@@ -671,15 +646,18 @@ func (es *EventSubscriber) handleRingLifecycle(callUUID, eventName string, event
 		Timestamp:   time.Now().Unix(),
 	}
 
-	go es.broadcastCallState(reg.userUuids, data)
+	for _, t := range reg.tenants {
+		go es.broadcastCallState(t, data)
+	}
 }
 
-// broadcastCallState sends a call state update to all users who received the ring.
-func (es *EventSubscriber) broadcastCallState(userUuids []string, data CallStateData) {
+// broadcastCallState sends a call state update to the users of one tenant who received the ring.
+func (es *EventSubscriber) broadcastCallState(t tenantRecipients, data CallStateData) {
 	payload := BroadcastPayload{
-		UserUUIDs: userUuids,
-		Type:      "call_state",
-		Data:      data,
+		UserUUIDs:  t.userUuids,
+		DomainUUID: t.domainUuid,
+		Type:       "call_state",
+		Data:       data,
 	}
 
 	if err := es.sendBroadcast("call_state", payload); err != nil {
@@ -706,11 +684,13 @@ func (es *EventSubscriber) resolveUser(extension, domainName string) *userCacheE
 		"p_domain_name": domainName,
 	})
 	if err != nil {
+		log.Printf("[Events] Resolve user for %s@%s: encode request: %v", extension, domainName, err)
 		return nil
 	}
 
 	req, err := http.NewRequest("POST", es.resolveURL, bytes.NewReader(payload))
 	if err != nil {
+		log.Printf("[Events] Resolve user for %s@%s: build request: %v", extension, domainName, err)
 		return nil
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -726,7 +706,9 @@ func (es *EventSubscriber) resolveUser(extension, domainName string) *userCacheE
 	}
 	defer resp.Body.Close()
 
+	// Status codes only: the response body is never logged.
 	if resp.StatusCode != 200 {
+		log.Printf("[Events] Resolve user for %s@%s: status %d; no ring pop", extension, domainName, resp.StatusCode)
 		return nil
 	}
 
@@ -734,7 +716,12 @@ func (es *EventSubscriber) resolveUser(extension, domainName string) *userCacheE
 		UserUUID   string `json:"user_uuid"`
 		DomainUUID string `json:"domain_uuid"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil || len(results) == 0 {
+	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+		log.Printf("[Events] Resolve user for %s@%s: response is not a JSON array of users; no ring pop", extension, domainName)
+		return nil
+	}
+	if len(results) == 0 {
+		log.Printf("[Events] Resolve user for %s@%s: no users; no ring pop", extension, domainName)
 		return nil
 	}
 
@@ -761,19 +748,21 @@ func (es *EventSubscriber) resolveUser(extension, domainName string) *userCacheE
 }
 
 // broadcastRing sends a user-targeted incoming_call event to the WebSocket worker.
-// Targets all users assigned to the ringing extension via userUuids batch matching.
-func (es *EventSubscriber) broadcastRing(userUuids []string, data RingCallData) {
+// Targets the users of one tenant assigned to the ringing extension, stamped
+// with that tenant.
+func (es *EventSubscriber) broadcastRing(t tenantRecipients, data RingCallData) {
 	payload := BroadcastPayload{
-		UserUUIDs: userUuids,
-		Type:      "incoming_call",
-		Data:      data,
+		UserUUIDs:  t.userUuids,
+		DomainUUID: t.domainUuid,
+		Type:       "incoming_call",
+		Data:       data,
 	}
 
 	if err := es.sendBroadcast("incoming_call", payload); err != nil {
 		log.Printf("[Events] Ring broadcast failed: %v", err)
 		return
 	}
-	log.Printf("[Events] Ring broadcast sent for %s → %d users %v", data.CallerIDNumber, len(userUuids), userUuids)
+	log.Printf("[Events] Ring broadcast sent for %s → %d users %v (domain %s)", data.CallerIDNumber, len(t.userUuids), t.userUuids, t.domainUuid)
 }
 
 // cleanupStaleRegistrations removes entries older than maxAge to prevent memory leaks.
@@ -788,14 +777,6 @@ func (es *EventSubscriber) cleanupStaleRegistrations(maxAge time.Duration) {
 		}
 	}
 	es.mu.Unlock()
-
-	es.inboundMu.Lock()
-	for uuid, seen := range es.seenInbound {
-		if seen.Before(cutoff) {
-			delete(es.seenInbound, uuid)
-		}
-	}
-	es.inboundMu.Unlock()
 
 	es.userCacheMu.Lock()
 	for key, entry := range es.userCache {
@@ -830,34 +811,4 @@ func eslDecode(s string) string {
 		return s
 	}
 	return decoded
-}
-
-// normalizeToE164 converts a phone number to E.164 format for topic matching.
-// Handles North American numbers (10 digits → +1xxx, 11 digits starting with 1 → +1xxx).
-// Numbers already starting with + are returned as-is after stripping non-digits.
-func normalizeToE164(number string) string {
-	if number == "" {
-		return number
-	}
-
-	hasPlus := strings.HasPrefix(number, "+")
-
-	var digits strings.Builder
-	for _, c := range number {
-		if c >= '0' && c <= '9' {
-			digits.WriteRune(c)
-		}
-	}
-	d := digits.String()
-
-	if hasPlus && len(d) >= 10 {
-		return "+" + d
-	}
-	if len(d) == 10 {
-		return "+1" + d
-	}
-	if len(d) == 11 && strings.HasPrefix(d, "1") {
-		return "+" + d
-	}
-	return number
 }
