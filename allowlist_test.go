@@ -31,6 +31,9 @@ const (
 	alAgentB = "77777777-7777-4777-8777-777777777777" // other's
 	alAgentN = "55555555-5555-4555-8555-555555555555" // just added, no contact yet
 	alAgentU = "66666666-6666-4666-8666-666666666666" // contact names no tenant
+	alAgentP = "88888888-8888-4888-8888-888888888881" // last saved in FusionPBX's agent page (sip_invite_domain=)
+	alAgentQ = "88888888-8888-4888-8888-888888888882" // FusionPBX loader's {…${caller_destination}…} list without a domain variable
+	alAgentX = "88888888-8888-4888-8888-888888888883" // variable and endpoint name different tenants
 )
 
 // recordingESL is an ESLClient that records each command and answers from a
@@ -126,6 +129,9 @@ const agentList = "name|instance_id|uuid|type|contact|status\n" +
 	alAgentB + "|single_box||callback|{call_timeout=25,domain_name=" + alOther + ",domain_uuid=y}user/104@" + alOther + "|Available\n" +
 	alAgentN + "|single_box||callback||Logged Out\n" +
 	alAgentU + "|single_box||callback|sofia/gateway/carrier/15145550100|Available\n" +
+	alAgentP + "|single_box||callback|{call_timeout=25,sip_invite_domain=" + alDomain + "}user/106@" + alDomain + "|Available\n" +
+	alAgentQ + "|single_box||callback|{call_timeout=30,sip_h_caller_destination=${caller_destination},call_timeout=20}user/107@" + alDomain + "|Available\n" +
+	alAgentX + "|single_box||callback|{call_timeout=25,sip_invite_domain=" + alOther + "}user/108@" + alDomain + "|Available\n" +
 	"105@" + alDomain + "|single_box||callback|user/105@" + alDomain + "|Available\n" +
 	"+OK\n"
 
@@ -542,7 +548,7 @@ func TestCallcenterAgentListFilter(t *testing.T) {
 	for _, r := range rows {
 		names = append(names, r["name"])
 	}
-	if strings.Join(names, ",") != alAgent+",105@"+alDomain {
+	if strings.Join(names, ",") != alAgent+","+alAgentP+","+alAgentQ+",105@"+alDomain {
 		t.Fatalf("agents %q", names)
 	}
 }
@@ -735,5 +741,49 @@ func TestCallDetailsUnrestrictedSeesBothLegs(t *testing.T) {
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || rec.Code != http.StatusOK || body.BLeg.Details == nil {
 		t.Fatalf("status %d, bleg details %v (%v)", rec.Code, body.BLeg.Details, err)
+	}
+}
+
+// Agents last saved in FusionPBX's PHP agent page carry sip_invite_domain=
+// instead of domain_name=; they belong to that tenant like any other.
+func TestCallcenterAgentSavedInFusionPBXPage(t *testing.T) {
+	for _, agent := range []string{alAgentP, alAgentQ} {
+		h, esl := newAllowlistHandler()
+		if rec := serve(h, "PUT", "/v1/callcenter/agents/"+agent, alDomain, map[string]any{"key": "status", "value": "On Break"}); rec.Code != http.StatusOK {
+			t.Fatalf("%s owner's change: %d %s", agent, rec.Code, rec.Body)
+		}
+		if rec := serve(h, "PUT", "/v1/callcenter/agents/"+agent, alOther, map[string]any{"key": "status", "value": "On Break"}); rec.Code != http.StatusForbidden {
+			t.Fatalf("%s another tenant's change: %d", agent, rec.Code)
+		}
+		if len(esl.writes()) != 1 {
+			t.Fatalf("commands %q", esl.writes())
+		}
+	}
+	rows := filterAgentsByDomain(ParsePipeDelimited(agentList), []string{alDomain})
+	var names []string
+	for _, r := range rows {
+		names = append(names, r["name"])
+	}
+	if strings.Join(names, ",") != alAgent+","+alAgentP+","+alAgentQ+",105@"+alDomain {
+		t.Fatalf("tenant's agent list %q", names)
+	}
+}
+
+// A contact whose domain variable and user/<ext>@<domain> endpoint name
+// different tenants belongs to neither: no restricted caller may change it,
+// and it is in nobody's list.
+func TestCallcenterAgentNamingTwoTenants(t *testing.T) {
+	for _, domain := range []string{alDomain, alOther} {
+		h, esl := newAllowlistHandler()
+		if rec := serve(h, "PUT", "/v1/callcenter/agents/"+alAgentX, domain, map[string]any{"key": "status", "value": "On Break"}); rec.Code != http.StatusForbidden || len(esl.writes()) != 0 {
+			t.Fatalf("%s: %d %q", domain, rec.Code, esl.writes())
+		}
+	}
+	for _, domain := range []string{alDomain, alOther} {
+		for _, r := range filterAgentsByDomain(ParsePipeDelimited(agentList), []string{domain}) {
+			if r["name"] == alAgentX {
+				t.Fatalf("listed for %s", domain)
+			}
+		}
 	}
 }

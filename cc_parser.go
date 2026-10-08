@@ -71,12 +71,16 @@ func ParsePlainCount(raw string) (int, error) {
 }
 
 // ExtractDomainFromContact extracts the domain_name value from a FreeSWITCH
-// agent contact field. The contact field contains key=value pairs and we look
-// for "domain_name=<value>". Returns empty string if not found.
+// agent contact field. Returns empty string if not found.
 func ExtractDomainFromContact(contact string) string {
-	// Look for the domain_name= variable: the whole key, at the start of the
-	// {...} list or after a comma (not another key ending in domain_name).
-	const prefix = "domain_name="
+	return contactVar(contact, "domain_name")
+}
+
+// contactVar is the value of variable key in a contact's {...} list: the
+// whole key, at the start of the list or after a comma (not another key that
+// merely ends in it). "" when absent.
+func contactVar(contact, key string) string {
+	prefix := key + "="
 	idx := -1
 	for from := 0; from < len(contact); {
 		i := strings.Index(contact[from:], prefix)
@@ -94,14 +98,8 @@ func ExtractDomainFromContact(contact string) string {
 		return ""
 	}
 
-	// Extract the value after domain_name=
-	start := idx + len(prefix)
-	if start >= len(contact) {
-		return ""
-	}
-
-	// The value ends at the next delimiter (comma, space, curly brace, or end of string)
-	rest := contact[start:]
+	// The value ends at the next delimiter (comma, space, curly brace, quote, or end of string)
+	rest := contact[idx+len(prefix):]
 	for i, ch := range rest {
 		if ch == ',' || ch == ' ' || ch == '}' || ch == '\'' || ch == '"' {
 			return rest[:i]

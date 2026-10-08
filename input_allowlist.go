@@ -156,8 +156,7 @@ type serialAPI interface {
 const unknownOwner = "(unknown)"
 
 // agentOwner is the tenant an existing agent belongs to, read from
-// `agent list`: the domain_name variable FusionPBX puts in every contact, else
-// the user/<ext>@<domain> contact itself, else the <name>@<domain> name.
+// `agent list` (agentRowOwner).
 // found is false when no such agent is loaded; owner is "" only for an agent
 // with no contact at all (one just added, before its contact is set), and
 // unknownOwner when the contact names no tenant.
@@ -176,16 +175,40 @@ func (h *APIHandler) agentOwner(name string) (owner string, found bool, err erro
 	return "", false, nil
 }
 
-// agentRowOwner is the owner of one `agent list` row (see agentOwner).
+// agentRowOwner is the owner of one `agent list` row (see agentOwner): the
+// contact's domain_name= (FusionPBX's config loader) or sip_invite_domain=
+// (FusionPBX's agent page, call_center_agent_edit.php) variable and its
+// user/<ext>@<domain> endpoint, which must agree when both are there (a
+// contact naming two tenants is unknownOwner); else the agent's
+// <name>@<domain> name.
 func agentRowOwner(row map[string]string) string {
 	contact := row["contact"]
-	if d := ExtractDomainFromContact(contact); d != "" {
-		return d
+	variable := contactVar(contact, "domain_name")
+	if variable == "" {
+		variable = contactVar(contact, "sip_invite_domain")
 	}
-	if rest, ok := strings.CutPrefix(contact, "user/"); ok {
+	if variable != "" && !domainNamePattern.MatchString(variable) {
+		return unknownOwner
+	}
+	// The endpoint follows the {...} list, whose values may hold ${...}, so
+	// it starts after the list's last brace.
+	endpoint := contact
+	if strings.HasPrefix(endpoint, "{") {
+		endpoint = endpoint[strings.LastIndex(endpoint, "}")+1:]
+	}
+	endpointDomain := ""
+	if rest, ok := strings.CutPrefix(endpoint, "user/"); ok {
 		if _, d, ok := strings.Cut(rest, "@"); ok && domainNamePattern.MatchString(d) {
-			return d
+			endpointDomain = d
 		}
+	}
+	switch {
+	case variable != "" && endpointDomain != "" && variable != endpointDomain:
+		return unknownOwner
+	case variable != "":
+		return variable
+	case endpointDomain != "":
+		return endpointDomain
 	}
 	if d, ok := splitQualified(row["name"], agentLocalPattern); ok {
 		return d
